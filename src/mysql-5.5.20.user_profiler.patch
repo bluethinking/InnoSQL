@@ -1,0 +1,1175 @@
+diff -urNad mysql-5.5.20.raw/include/my_base.h mysql-5.5.20.new/include/my_base.h
+--- mysql-5.5.20.raw/include/my_base.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/include/my_base.h	2012-07-30 17:13:17.000000000 +0800
+@@ -449,7 +449,12 @@
+ #define HA_ERR_INDEX_COL_TOO_LONG 178	 /* Index column length exceeds limit */
+ #define HA_ERR_INDEX_CORRUPT      179	 /* Index corrupted */
+ #define HA_ERR_UNDO_REC_TOO_BIG   180    /* Undo log record too big */
+-#define HA_ERR_LAST               180    /* Copy of last error nr */
++#define HA_ERR_CPU_TIMES_LIMITED 181
++#define HA_ERR_IO_READS_LIMITED 182
++#define HA_ERR_TRX_CPU_TIMES_LIMITED 183
++#define HA_ERR_TRX_IO_READS_LIMITED 184
++#define HA_ERR_PROFILER_ACCESS_DENIED 185
++#define HA_ERR_LAST               185    /* Copy of last error nr */
+ 
+ /* Number of different errors */
+ #define HA_ERR_ERRORS            (HA_ERR_LAST - HA_ERR_FIRST + 1)
+diff -urNad mysql-5.5.20.raw/include/my_sys.h mysql-5.5.20.new/include/my_sys.h
+--- mysql-5.5.20.raw/include/my_sys.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/include/my_sys.h	2012-07-30 17:13:17.000000000 +0800
+@@ -150,6 +150,11 @@
+ #define GETDATE_FIXEDLENGTH	16
+ 
+ 	/* defines when allocating data */
++typedef void (*malloc_callback)(size_t size);
++typedef void (*free_callback)(size_t size);
++extern void set_malloc_callback(malloc_callback func);
++extern void set_free_callback(free_callback func);
++
+ extern void *my_malloc(size_t Size,myf MyFlags);
+ extern void *my_multi_malloc(myf MyFlags, ...);
+ extern void *my_realloc(void *oldpoint, size_t Size, myf MyFlags);
+diff -urNad mysql-5.5.20.raw/mysys/my_handler_errors.h mysql-5.5.20.new/mysys/my_handler_errors.h
+--- mysql-5.5.20.raw/mysys/my_handler_errors.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/mysys/my_handler_errors.h	2012-07-30 17:13:17.000000000 +0800
+@@ -83,7 +83,12 @@
+   "Too many active concurrent transactions",
+   "Index column length exceeds limit",
+   "Index corrupted",
+-  "Undo record too big"
++  "Undo record too big",
++  "User's CPU resource is exhausted",
++  "User's IO resource is exhausted",
++  "Current trx CPU times is more than the user limited, the trx will be rollback",
++  "Current trx IO reads is more than the user limited, the trx will be rollback",
++  "Failed to access the user_profiler table with no super privilege"
+ };
+ 
+ extern void my_handler_error_register(void);
+diff -urNad mysql-5.5.20.raw/mysys/my_malloc.c mysql-5.5.20.new/mysys/my_malloc.c
+--- mysql-5.5.20.raw/mysys/my_malloc.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/mysys/my_malloc.c	2012-07-30 17:13:17.000000000 +0800
+@@ -17,6 +17,22 @@
+ #include "mysys_err.h"
+ #include <m_string.h>
+ 
++
++malloc_callback malloc_callback_func = NULL;
++free_callback free_callback_func = NULL;
++#ifdef __WIN__
++#define malloc_usable_size(ptr)	_msize(ptr)
++#endif
++
++void set_malloc_callback(malloc_callback func)
++{
++	malloc_callback_func = func;
++}
++
++void set_free_callback(free_callback func)
++{
++	free_callback_func = func;
++}
+ /**
+   Allocate a sized block of memory.
+ 
+@@ -55,7 +71,13 @@
+       exit(1);
+   }
+   else if (my_flags & MY_ZEROFILL)
++  {
+     bzero(point, size);
++  }
++  if(malloc_callback_func)
++  {
++	  malloc_callback_func(malloc_usable_size(point));
++  }
+   DBUG_PRINT("exit",("ptr: %p", point));
+   DBUG_RETURN(point);
+ }
+@@ -125,6 +147,8 @@
+ {
+   DBUG_ENTER("my_free");
+   DBUG_PRINT("my",("ptr: %p", ptr));
++  if(free_callback_func != NULL && ptr != NULL)
++	  free_callback_func(malloc_usable_size(ptr));
+   free(ptr);
+   DBUG_VOID_RETURN;
+ }
+diff -urNad mysql-5.5.20.raw/scripts/mysql_system_tables.sql mysql-5.5.20.new/scripts/mysql_system_tables.sql
+--- mysql-5.5.20.raw/scripts/mysql_system_tables.sql	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/scripts/mysql_system_tables.sql	2012-07-30 17:13:17.000000000 +0800
+@@ -33,6 +33,10 @@
+ -- Remember for later if user table already existed
+ set @had_user_table= @@warning_count != 0;
+ 
++CREATE TABLE IF NOT EXISTS user_profiler(	 Host char(60) binary DEFAULT '' NOT NULL, User char(16) binary DEFAULT '' NOT NULL, Max_cpu_times int(11) unsigned DEFAULT 0 NOT NULL,Curr_cpu_times int(11) unsigned DEFAULT 0 NOT NULL, Max_io_reads int(11) unsigned DEFAULT 0 NOT NULL,Curr_io_reads int(11) unsigned DEFAULT 0 NOT NULL, Max_mem_size int(11) unsigned DEFAULT 0 NOT NULL, Max_cpu_times_per_trx int(11) unsigned DEFAULT 0 NOT NULL, Max_io_reads_per_trx int(11) unsigned DEFAULT 0 NOT NULL, Operate_priv enum('N','Y') DEFAULT 'N' NOT NULL,PRIMARY KEY Host (Host,User)) engine=MyISAM CHARACTER SET utf8 COLLATE utf8_bin comment='Users profiler';;
++
++-- Remember for later if user_profiler table already existed
++set @had_user_profiler_table= @@warning_count != 0;
+ 
+ CREATE TABLE IF NOT EXISTS func (  name char(64) binary DEFAULT '' NOT NULL, ret tinyint(1) DEFAULT '0' NOT NULL, dl char(128) DEFAULT '' NOT NULL, type enum ('function','aggregate') COLLATE utf8_general_ci NOT NULL, PRIMARY KEY (name) ) engine=MyISAM CHARACTER SET utf8 COLLATE utf8_bin   comment='User defined functions';
+ 
+diff -urNad mysql-5.5.20.raw/scripts/mysql_system_tables_data.sql mysql-5.5.20.new/scripts/mysql_system_tables_data.sql
+--- mysql-5.5.20.raw/scripts/mysql_system_tables_data.sql	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/scripts/mysql_system_tables_data.sql	2012-07-30 17:13:17.000000000 +0800
+@@ -50,3 +50,9 @@
+ REPLACE INTO tmp_proxies_priv SELECT @current_hostname, 'root', '', '', TRUE, '', now() FROM DUAL WHERE LOWER (@current_hostname) != 'localhost';
+ INSERT INTO  proxies_priv SELECT * FROM tmp_proxies_priv WHERE @had_proxies_priv_table=0;
+ DROP TABLE tmp_proxies_priv;
++
++CREATE TEMPORARY TABLE tmp_user_profiler LIKE user_profiler;
++INSERT INTO tmp_user_profiler VALUES ('localhost', 'root', 0,0,0,0,0,0,0,'Y');
++REPLACE INTO tmp_user_profiler SELECT @current_hostname, 'root',0,0,0,0,0,0,0,'Y' FROM DUAL WHERE LOWER (@current_hostname) != 'localhost';
++INSERT INTO  user_profiler SELECT * FROM tmp_user_profiler WHERE @had_user_profiler_table=0;
++DROP TABLE tmp_user_profiler;
+diff -urNad mysql-5.5.20.raw/sql/CMakeLists.txt mysql-5.5.20.new/sql/CMakeLists.txt
+--- mysql-5.5.20.raw/sql/CMakeLists.txt	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/CMakeLists.txt	2012-07-30 17:13:17.000000000 +0800
+@@ -76,6 +76,7 @@
+                sql_profile.cc event_parse_data.cc sql_alter.cc
+                sql_signal.cc rpl_handler.cc mdl.cc sql_admin.cc
+                transaction.cc sys_vars.cc sql_truncate.cc datadict.cc
++               resource_profiler.cc
+                sql_reload.cc
+                ${GEN_SOURCES}
+                ${MYSYS_LIBWRAP_SOURCE})
+@@ -95,9 +96,9 @@
+ # On Windows platform we compile in the clinet-side Windows Native Authentication
+ # plugin which is used by the client connection code included in the server.
+ #
+-IF(WIN32)
+-  ADD_DEFINITIONS(-DAUTHENTICATION_WIN)
+-  TARGET_LINK_LIBRARIES(sql auth_win_client)
++IF(WIN32)
++  ADD_DEFINITIONS(-DAUTHENTICATION_WIN)
++  TARGET_LINK_LIBRARIES(sql auth_win_client)
+ ENDIF() 
+ 
+ IF(WIN32)
+diff -urNad mysql-5.5.20.raw/sql/filesort.cc mysql-5.5.20.new/sql/filesort.cc
+--- mysql-5.5.20.raw/sql/filesort.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/filesort.cc	2012-08-01 11:01:37.000000000 +0800
+@@ -33,7 +33,7 @@
+ #include "sql_test.h"                           // TEST_filesort
+ #include "opt_range.h"                          // SQL_SELECT
+ #include "debug_sync.h"
+-
++#include "resource_profiler.h"
+ /// How to write record_ref.
+ #define WRITE_REF(file,from) \
+ if (my_b_write((file),(uchar*) (from),param->ref_length)) \
+@@ -610,7 +610,7 @@
+       if (error && error != HA_ERR_RECORD_DELETED)
+ 	break;
+     }
+-
++	resource_statistics(0);
+     if (*killed)
+     {
+       DBUG_PRINT("info",("Sort killed by user"));
+@@ -1289,6 +1289,10 @@
+     }
+     for (;;)
+     {
++	  if(resource_statistics(0) != 0)
++	  {
++		error = 1; goto err;
++	  }
+       buffpek= (BUFFPEK*) queue_top(&queue);
+       if (cmp)                                        // Remove duplicates
+       {
+@@ -1353,6 +1357,10 @@
+ 
+   do
+   {
++	if(resource_statistics(0) != 0)
++	{
++	  error = 1; goto err;
++	}
+     if ((ha_rows) buffpek->mem_count > max_rows)
+     {                                        /* Don't write too many records */
+       buffpek->mem_count= (uint) max_rows;
+diff -urNad mysql-5.5.20.raw/sql/handler.cc mysql-5.5.20.new/sql/handler.cc
+--- mysql-5.5.20.raw/sql/handler.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/handler.cc	2012-08-01 10:40:45.000000000 +0800
+@@ -40,6 +40,7 @@
+ #include <errno.h>
+ #include "probes_mysql.h"
+ #include "debug_sync.h"         // DEBUG_SYNC
++#include "resource_profiler.h"
+ 
+ #ifdef WITH_PARTITION_STORAGE_ENGINE
+ #include "ha_partition.h"
+@@ -459,6 +460,7 @@
+   }
+ 
+   hton->slot= HA_SLOT_UNDEF;
++  hton->resource_profiler_ptr = resource_statistics;
+   /* Historical Requirement */
+   plugin->data= hton; // shortcut for the future
+   if (plugin->plugin->init && plugin->plugin->init(hton))
+@@ -2878,6 +2880,20 @@
+   case HA_ERR_UNDO_REC_TOO_BIG:
+     textno= ER_UNDO_RECORD_TOO_BIG;
+     break;
++  case HA_ERR_CPU_TIMES_LIMITED:
++	textno = ER_CPU_TIMES_LIMITED;
++	break;
++  case HA_ERR_IO_READS_LIMITED:
++	textno = ER_IO_READS_LIMITED;
++	break;
++  case HA_ERR_TRX_CPU_TIMES_LIMITED:
++	textno = ER_TRX_CPU_TIMES_LIMITED;
++	break;
++  case HA_ERR_TRX_IO_READS_LIMITED:
++	textno = ER_TRX_IO_READS_LIMITED;
++  case HA_ERR_PROFILER_ACCESS_DENIED:
++	textno = ER_PROFILER_ACCESS_DENIED;
++	break;
+   default:
+     {
+       /* The error was "unknown" to this function.
+diff -urNad mysql-5.5.20.raw/sql/handler.h mysql-5.5.20.new/sql/handler.h
+--- mysql-5.5.20.raw/sql/handler.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/handler.h	2012-08-01 10:43:45.000000000 +0800
+@@ -800,6 +800,7 @@
+                      const char *wild, bool dir, List<LEX_STRING> *files);
+    int (*table_exists_in_engine)(handlerton *hton, THD* thd, const char *db,
+                                  const char *name);
++   int (*resource_profiler_ptr)(int with_io_read);
+    uint32 license; /* Flag for Engine License */
+    void *data; /* Location for engines to keep personal structures */
+ };
+diff -urNad mysql-5.5.20.raw/sql/mysqld.cc mysql-5.5.20.new/sql/mysqld.cc
+--- mysql-5.5.20.raw/sql/mysqld.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/mysqld.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -91,7 +91,7 @@
+ #include "sp_rcontext.h"
+ #include "sp_cache.h"
+ #include "sql_reload.h"  // reload_acl_and_cache
+-
++#include "resource_profiler.h"
+ #ifdef HAVE_POLL_H
+ #include <poll.h>
+ #endif
+@@ -356,6 +356,7 @@
+ 
+ bool opt_bin_log, opt_ignore_builtin_innodb= 0;
+ my_bool opt_log, opt_slow_log;
++uint  opt_profiler_record;
+ ulonglong log_output_options;
+ my_bool opt_log_queries_not_using_indexes= 0;
+ bool opt_error_log= IF_WIN(1,0);
+@@ -625,7 +626,7 @@
+   LOCK_delayed_insert, LOCK_delayed_status, LOCK_delayed_create,
+   LOCK_crypt,
+   LOCK_global_system_variables,
+-  LOCK_user_conn, LOCK_slave_list, LOCK_active_mi,
++  LOCK_user_conn, LOCK_curr_resources, LOCK_slave_list, LOCK_active_mi,
+   LOCK_connection_count, LOCK_error_messages;
+ /**
+   The below lock protects access to two global server variables:
+@@ -1482,6 +1483,7 @@
+   my_free(opt_bin_logname);
+   bitmap_free(&temp_pool);
+   free_max_user_conn();
++  free_max_curr_resources();
+ #ifdef HAVE_REPLICATION
+   end_slave_list();
+ #endif
+@@ -3446,6 +3448,7 @@
+                    &LOCK_manager, MY_MUTEX_INIT_FAST);
+   mysql_mutex_init(key_LOCK_crypt, &LOCK_crypt, MY_MUTEX_INIT_FAST);
+   mysql_mutex_init(key_LOCK_user_conn, &LOCK_user_conn, MY_MUTEX_INIT_FAST);
++  mysql_mutex_init(key_LOCK_curr_resources, &LOCK_curr_resources, MY_MUTEX_INIT_FAST);
+   mysql_mutex_init(key_LOCK_active_mi, &LOCK_active_mi, MY_MUTEX_INIT_FAST);
+   mysql_mutex_init(key_LOCK_global_system_variables,
+                    &LOCK_global_system_variables, MY_MUTEX_INIT_FAST);
+@@ -3989,6 +3992,7 @@
+   ft_init_stopwords();
+ 
+   init_max_user_conn();
++  init_max_curr_resources();
+   init_update_queries();
+   DBUG_RETURN(0);
+ }
+@@ -4147,6 +4151,8 @@
+ 
+   orig_argc= argc;
+   orig_argv= argv;
++  set_malloc_callback(my_malloc_callback_func);
++  set_free_callback(my_free_callback_func);
+   my_getopt_use_args_separator= TRUE;
+   if (load_defaults(MYSQL_CONFIG_NAME, load_default_groups, &argc, &argv))
+     return 1;
+@@ -6001,6 +6007,36 @@
+   return 0;
+ }
+ 
++static int show_cpu_times(THD *thd, SHOW_VAR *var, char *buff)
++{
++  var->type = SHOW_CHAR;
++  if(thd->user_connect)
++    sprintf(buff,"%llu/%llu",thd->user_connect->curr_resources->curr_cpu_times,thd->user_connect->user_resources.cpu_times);
++  else
++  	sprintf(buff,"%d/%d",0,0);
++  var->value = buff;
++  return 0;
++}
++	
++static int show_io_used(THD *thd, SHOW_VAR *var, char *buff)
++{
++  var->type = SHOW_CHAR;
++  if(thd->user_connect)
++    sprintf(buff,"%llu/%llu",thd->user_connect->curr_resources->curr_io_reads,thd->user_connect->user_resources.io_reads);
++  else
++    sprintf(buff,"%u/%u",0,0);
++  var->value = buff;
++  return 0;
++}
++	
++static int show_mem_size(THD *thd, SHOW_VAR *var, char *buff)
++{
++  var->type = SHOW_CHAR;
++  sprintf(buff,"%u/%u",thd->mem_size,thd->max_mem_size);
++  var->value = buff;
++  return 0;
++}
++
+ #ifdef ENABLED_PROFILING
+ static int show_flushstatustime(THD *thd, SHOW_VAR *var, char *buff)
+ {
+@@ -6504,6 +6540,9 @@
+ #ifdef ENABLED_PROFILING
+   {"Uptime_since_flush_status",(char*) &show_flushstatustime,   SHOW_FUNC},
+ #endif
++  {"Threads_cpu_times_used",   (char*) &show_cpu_times,			SHOW_FUNC},
++  {"Threads_io_used",		   (char*) &show_io_used,			SHOW_FUNC},
++  {"Threads_mem_size",		   (char*) &show_mem_size,			SHOW_FUNC},
+   {NullS, NullS, SHOW_LONG}
+ };
+ 
+@@ -7678,7 +7717,7 @@
+   key_LOCK_prepared_stmt_count,
+   key_LOCK_rpl_status, key_LOCK_server_started, key_LOCK_status,
+   key_LOCK_system_variables_hash, key_LOCK_table_share, key_LOCK_thd_data,
+-  key_LOCK_user_conn, key_LOCK_uuid_generator, key_LOG_LOCK_log,
++  key_LOCK_user_conn,key_LOCK_curr_resources ,key_LOCK_uuid_generator, key_LOG_LOCK_log,
+   key_master_info_data_lock, key_master_info_run_lock,
+   key_mutex_slave_reporting_capability_err_lock, key_relay_log_info_data_lock,
+   key_relay_log_info_log_space_lock, key_relay_log_info_run_lock,
+@@ -7723,6 +7762,7 @@
+   { &key_LOCK_table_share, "LOCK_table_share", PSI_FLAG_GLOBAL},
+   { &key_LOCK_thd_data, "THD::LOCK_thd_data", 0},
+   { &key_LOCK_user_conn, "LOCK_user_conn", PSI_FLAG_GLOBAL},
++  { &key_LOCK_curr_resources, "LOCK_curr_resources", PSI_FLAG_GLOBAL},
+   { &key_LOCK_uuid_generator, "LOCK_uuid_generator", PSI_FLAG_GLOBAL},
+   { &key_LOG_LOCK_log, "LOG::LOCK_log", 0},
+   { &key_master_info_data_lock, "Master_info::data_lock", 0},
+diff -urNad mysql-5.5.20.raw/sql/mysqld.h mysql-5.5.20.new/sql/mysqld.h
+--- mysql-5.5.20.raw/sql/mysqld.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/mysqld.h	2012-07-30 17:13:17.000000000 +0800
+@@ -89,6 +89,7 @@
+ extern bool opt_large_files, server_id_supplied;
+ extern bool opt_update_log, opt_bin_log, opt_error_log;
+ extern my_bool opt_log, opt_slow_log;
++extern uint opt_profiler_record;
+ extern my_bool opt_backup_history_log;
+ extern my_bool opt_backup_progress_log;
+ extern ulonglong log_output_options;
+@@ -242,7 +243,7 @@
+   key_LOCK_prepared_stmt_count,
+   key_LOCK_rpl_status, key_LOCK_server_started, key_LOCK_status,
+   key_LOCK_table_share, key_LOCK_thd_data,
+-  key_LOCK_user_conn, key_LOCK_uuid_generator, key_LOG_LOCK_log,
++  key_LOCK_user_conn, key_LOCK_curr_resources, key_LOCK_uuid_generator, key_LOG_LOCK_log,
+   key_master_info_data_lock, key_master_info_run_lock,
+   key_mutex_slave_reporting_capability_err_lock, key_relay_log_info_data_lock,
+   key_relay_log_info_log_space_lock, key_relay_log_info_run_lock,
+@@ -335,7 +336,7 @@
+        LOCK_error_log, LOCK_delayed_insert, LOCK_uuid_generator,
+        LOCK_delayed_status, LOCK_delayed_create, LOCK_crypt, LOCK_timezone,
+        LOCK_slave_list, LOCK_active_mi, LOCK_manager,
+-       LOCK_global_system_variables, LOCK_user_conn,
++       LOCK_global_system_variables, LOCK_user_conn,LOCK_curr_resources,
+        LOCK_prepared_stmt_count, LOCK_error_messages, LOCK_connection_count;
+ extern MYSQL_PLUGIN_IMPORT mysql_mutex_t LOCK_thread_count;
+ #ifdef HAVE_OPENSSL
+diff -urNad mysql-5.5.20.raw/sql/resource_profiler.cc mysql-5.5.20.new/sql/resource_profiler.cc
+--- mysql-5.5.20.raw/sql/resource_profiler.cc	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/sql/resource_profiler.cc	2012-08-01 10:44:37.000000000 +0800
+@@ -0,0 +1,115 @@
++#include "resource_profiler.h"
++#include "sql_class.h"
++
++//#define STATISTICS_DEBUG
++/* RETURN: the thread's user times unit 1ms*/
++static ulonglong get_thread_time(THD *thd)
++{
++	DBUG_ASSERT(thd != NULL);
++	ulonglong ret_time = 0; 
++#ifdef __WIN__
++	int64 CreateTime,ExitTime,KernelTime,UserTime;
++	HANDLE handle = OpenThread(THREAD_ALL_ACCESS, FALSE, thd->real_id);
++	if (handle != INVALID_HANDLE_VALUE &&
++		GetThreadTimes(handle,(LPFILETIME)&CreateTime,(LPFILETIME)&ExitTime,(LPFILETIME)&KernelTime,(LPFILETIME)&UserTime))
++	{
++		ret_time = UserTime;
++	}
++#else
++	struct timespec tp;
++	clock_gettime(CLOCK_THREAD_CPUTIME_ID,&tp);
++	ret_time = tp.tv_sec * 10000000 + tp.tv_nsec / 100;
++#endif
++	return ret_time / 10000;
++}
++
++void start_trx_statistics(THD *thd)
++{
++  if(thd->user_connect != NULL)
++  {
++	thd->error = 0;
++	thd->conn_io_reads_per_trx = 0;
++	thd->conn_cpu_times_per_trx = 0;
++	thd->trx_start_thread_times = get_thread_time(thd);
++#ifdef STATISTICS_DEBUG
++	printf("reset !! conn_io_reads_per_trx = 0, conn_cpu_times_per_trx=%llu\n",thd->conn_cpu_times_per_trx);
++#endif
++  }
++}
++static int end_trx_statistics(THD *thd)
++{
++  if( thd->user_connect != NULL)
++  {
++	if(thd->user_connect->user_resources.cpu_times != 0 &&
++	  thd->user_connect->curr_resources->curr_cpu_times >= thd->user_connect->user_resources.cpu_times)
++	{
++	  my_error(ER_CPU_TIMES_LIMITED,MYF(0),thd->user_connect->user, thd->user_connect->host);
++	  return thd->error = ER_CPU_TIMES_LIMITED;
++	}
++	else if(thd->user_connect->user_resources.io_reads != 0 &&
++	  thd->user_connect->curr_resources->curr_io_reads >= thd->user_connect->user_resources.io_reads)
++	{
++	  my_error(ER_IO_READS_LIMITED,MYF(0),thd->user_connect->user, thd->user_connect->host);
++	  return thd->error = ER_IO_READS_LIMITED;
++	}
++	else if(thd->user_connect->user_resources.io_reads_per_trx != 0 &&
++	  thd->conn_io_reads_per_trx >= thd->user_connect->user_resources.io_reads_per_trx)
++	{
++	  my_error(ER_TRX_IO_READS_LIMITED,MYF(0),thd->user_connect->user, thd->user_connect->host);
++	  return thd->error = ER_TRX_IO_READS_LIMITED;
++	}
++	else if(thd->user_connect->user_resources.cpu_times_per_trx != 0 &&
++	  thd->conn_cpu_times_per_trx >= thd->user_connect->user_resources.cpu_times_per_trx)
++	{
++	  my_error(ER_TRX_CPU_TIMES_LIMITED,MYF(0),thd->user_connect->user, thd->user_connect->host);
++	  return thd->error = ER_TRX_CPU_TIMES_LIMITED;
++	}
++#ifdef STATISTICS_DEBUG
++	printf("cpu_times=%llu,cpu_times_per_trx=%llu,io_reads=%llu,io_reads_per_trx=%llu\n",
++	thd->user_connect->curr_resources->curr_cpu_times,thd->conn_cpu_times_per_trx, 
++	thd->user_connect->conn_io_reads, thd->conn_io_reads_per_trx);
++#endif
++  }
++  return 0;
++}
++
++int resource_statistics(int with_io_read)
++{
++	THD *thd = current_thd;
++	if( thd == NULL || thd->user_connect == NULL) return 0;
++	if(end_trx_statistics(thd) != 0)
++	{
++	  thd->awake(THD::KILL_QUERY);
++	  return -1;
++	}
++	ulonglong curr_times = get_thread_time(thd);
++	ulonglong time_span = curr_times - thd->trx_start_thread_times;
++	thd->conn_cpu_times_per_trx += time_span;
++	thd->user_connect->curr_resources->curr_cpu_times += time_span;
++	thd->trx_start_thread_times = curr_times;
++	if(with_io_read)
++	{
++	  thd->conn_io_reads_per_trx++;
++	  thd->user_connect->curr_resources->curr_io_reads++;
++	}
++	return 0;
++}
++
++void my_malloc_callback_func(size_t size)
++{
++  THD *thd = current_thd;
++  if(thd != NULL)
++  {
++  	thd->mem_size += size;
++	thd->max_mem_size = thd->max_mem_size < thd->mem_size ? thd->mem_size : thd->max_mem_size;
++  }
++}
++
++void my_free_callback_func(size_t size)
++{
++  THD *thd = current_thd;
++  if (thd != NULL)
++  {
++  	thd->mem_size -= size;
++  }
++}
+diff -urNad mysql-5.5.20.raw/sql/resource_profiler.h mysql-5.5.20.new/sql/resource_profiler.h
+--- mysql-5.5.20.raw/sql/resource_profiler.h	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/sql/resource_profiler.h	2012-08-01 10:44:20.000000000 +0800
+@@ -0,0 +1,21 @@
++#ifndef _RESOURCE_PROFILE_H_
++#define _RESOURCE_PROFILE_H_
++
++#ifndef __WIN__
++#include<unistd.h>
++#endif
++
++#ifdef __cplusplus
++
++class THD;
++extern "C"
++{
++#endif
++	void start_trx_statistics(THD *thd);
++	int  resource_statistics(int with_io_read);
++	void my_malloc_callback_func(size_t size);
++	void my_free_callback_func(size_t size);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff -urNad mysql-5.5.20.raw/sql/share/errmsg-utf8.txt mysql-5.5.20.new/sql/share/errmsg-utf8.txt
+--- mysql-5.5.20.raw/sql/share/errmsg-utf8.txt	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/share/errmsg-utf8.txt	2012-07-30 17:13:17.000000000 +0800
+@@ -6486,3 +6486,18 @@
+ 
+ ER_PLUGIN_NO_INSTALL
+   eng "Plugin '%s' is marked as not dynamically installable. You have to stop the server to install it."
++
++ER_CPU_TIMES_LIMITED
++  eng "User '%s@%s' CPU resource is exhausted."
++
++ER_IO_READS_LIMITED
++  eng "User '%s@%s' IO resource is exhausted."
++
++ER_TRX_CPU_TIMES_LIMITED
++  eng "User '%s@%s' CPU times of the TRX limited."
++
++ER_TRX_IO_READS_LIMITED
++  eng "User '%s@%s' IO reads of the TRX limited."
++
++ER_PROFILER_ACCESS_DENIED
++  eng "User '%s@%s' can't access the user_profiler table."
+\ No newline at end of file
+diff -urNad mysql-5.5.20.raw/sql/sql_acl.cc mysql-5.5.20.new/sql/sql_acl.cc
+--- mysql-5.5.20.raw/sql/sql_acl.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_acl.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -1043,7 +1043,53 @@
+                     "please run mysql_upgrade to create it");
+   }
+   freeze_size(&acl_proxy_users);
++  //
++  if(tables[4].table)
++  {
++	init_read_record(&read_record_info, thd, table= tables[4].table, NULL, 1, 0, FALSE);
++	table->use_all_columns();
++	while (!(read_record_info.read_record(&read_record_info)))
++	{
++	  acl_host_and_ip host;
++	  uint next_field = 0;
++	  update_hostname(&host,get_field(&mem, table->field[next_field++]));
++	  char *user = get_field(&mem, table->field[next_field++]);
++	  if( user == NULL) continue;
+ 
++	  ACL_USER *acl_user = NULL;
++	  for (uint i=0 ; i < acl_users.elements ; i++)
++	  {
++		ACL_USER *acl_user_tmp = dynamic_element(&acl_users,i,ACL_USER*);
++		if (acl_user_tmp->user && strcmp(user, acl_user_tmp->user) == 0)
++		{
++		  if (strcmp(host.hostname,acl_user_tmp->host.hostname) == 0 && host.ip == acl_user_tmp->host.ip)
++		  {
++		    acl_user= acl_user_tmp;
++		    break;
++		  }
++		}
++	  }
++	  if (acl_user != NULL)
++	  {
++		char *ptr = get_field(thd->mem_root, table->field[next_field++]);
++		acl_user->user_resource.cpu_times = ptr ? atoi(ptr) : 0;
++		ptr = get_field(thd->mem_root, table->field[next_field++]);
++		acl_user->user_resource.curr_cpu_times = ptr ? atoi(ptr) : 0;
++		ptr = get_field(thd->mem_root, table->field[next_field++]);
++		acl_user->user_resource.io_reads = ptr ? atoi(ptr) : 0;
++		ptr = get_field(thd->mem_root, table->field[next_field++]);
++		acl_user->user_resource.curr_io_reads = ptr ? atoi(ptr) : 0;
++		ptr = get_field(thd->mem_root, table->field[next_field++]);
++		acl_user->user_resource.mem_size = ptr ? atoi(ptr) : 0;
++		ptr = get_field(thd->mem_root, table->field[next_field++]);
++		acl_user->user_resource.cpu_times_per_trx = ptr ? atoi(ptr) : 0;
++		ptr = get_field(thd->mem_root, table->field[next_field++]);
++		acl_user->user_resource.io_reads_per_trx = ptr ? atoi(ptr) : 0;
++		acl_user->user_resource.operate_priv = get_access(table,next_field,&next_field);
++	  }
++	}
++	end_read_record(&read_record_info);
++  }
+   init_check_host();
+ 
+   initialized=1;
+@@ -1074,7 +1120,55 @@
+     acl_cache=0;
+   }
+ }
+-
++/* store the current CPU times and io reads of the user@localhost into the table */
++my_bool acl_profiler_record(THD *thd)
++{
++  TABLE *table;
++  TABLE_LIST tables;
++  my_bool return_val = TRUE;
++  READ_RECORD read_record_info;
++  DBUG_ENTER("acl_profiler_record");
++  if(thd->user_connect == NULL)
++  {
++  	goto err;
++  }
++  tables.init_one_table(C_STRING_WITH_LEN("mysql"),
++  	C_STRING_WITH_LEN("user_profiler"), 
++  	"user_profiler", TL_WRITE_CONCURRENT_INSERT);
++  if(open_and_lock_tables(thd,&tables,FALSE,MYSQL_LOCK_IGNORE_TIMEOUT))
++  {
++  	if (thd->stmt_da->is_error())
++  	  sql_print_error("Fatal error: Can't open and lock privilege tables: %s",thd->stmt_da->message());
++  	goto end;
++  }
++  init_sql_alloc(&mem, ACL_ALLOC_BLOCK_SIZE, 0);
++  init_read_record(&read_record_info,thd,table= tables.table,NULL,1,0,FALSE);
++  table->use_all_columns();
++  while (!(read_record_info.read_record(&read_record_info)))
++  {
++  	acl_host_and_ip host;
++  	uint next_field = 0;
++  	update_hostname(&host,get_field(&mem, table->field[next_field++]));
++  	char *user = get_field(&mem, table->field[next_field++]);
++  	if(user == NULL 
++  		|| strcmp(user,thd->user_connect->user) != 0 
++  		|| strcmp(host.hostname, thd->user_connect->host) != 0)
++  	{
++  	  continue;
++  	}
++	store_record(table, record[1]);
++  	table->field[3]->store((ulonglong)thd->user_connect->curr_resources->curr_cpu_times,TRUE);/* curr_cpu_times */
++  	table->field[5]->store((ulonglong)thd->user_connect->curr_resources->curr_io_reads, TRUE);/* curr_io_reads */
++  	break;
++  }
++  end_read_record(&read_record_info);
++  if(table->file->ha_update_row(table->record[1],table->record[0]))
++	goto end;
++end:
++	close_mysql_tables(thd);
++err:
++	DBUG_RETURN(return_val);
++}
+ 
+ /*
+   Forget current user/db-level privileges and read new privileges
+@@ -1094,10 +1188,9 @@
+     FALSE  Success
+     TRUE   Failure
+ */
+-
+ my_bool acl_reload(THD *thd)
+ {
+-  TABLE_LIST tables[4];
++  TABLE_LIST tables[5];
+   DYNAMIC_ARRAY old_acl_hosts, old_acl_users, old_acl_dbs, old_acl_proxy_users;
+   MEM_ROOT old_mem;
+   bool old_initialized;
+@@ -1117,12 +1210,16 @@
+   tables[3].init_one_table(C_STRING_WITH_LEN("mysql"),
+                            C_STRING_WITH_LEN("proxies_priv"), 
+                            "proxies_priv", TL_READ);
++  tables[4].init_one_table(C_STRING_WITH_LEN("mysql"),
++						   C_STRING_WITH_LEN("user_profiler"), 
++							"user_profiler", TL_READ);
+   tables[0].next_local= tables[0].next_global= tables + 1;
+   tables[1].next_local= tables[1].next_global= tables + 2;
+   tables[2].next_local= tables[2].next_global= tables + 3;
++  tables[3].next_local= tables[3].next_global= tables + 4;
+   tables[0].open_type= tables[1].open_type= tables[2].open_type= 
+-  tables[3].open_type= OT_BASE_ONLY;
+-  tables[3].open_strategy= TABLE_LIST::OPEN_IF_EXISTS;
++  tables[3].open_type= tables[4].open_type = OT_BASE_ONLY;
++  tables[3].open_strategy= tables[4].open_strategy = TABLE_LIST::OPEN_IF_EXISTS;
+ 
+   if (open_and_lock_tables(thd, tables, FALSE, MYSQL_LOCK_IGNORE_TIMEOUT))
+   {
+@@ -9448,6 +9545,12 @@
+     if ((acl_user->user_resource.questions || acl_user->user_resource.updates ||
+          acl_user->user_resource.conn_per_hour ||
+          acl_user->user_resource.user_conn || 
++		 acl_user->user_resource.cpu_times ||
++		 acl_user->user_resource.io_reads ||
++		 acl_user->user_resource.mem_size ||
++		 acl_user->user_resource.cpu_times_per_trx ||
++		 acl_user->user_resource.io_reads_per_trx ||
++		 acl_user->user_resource.operate_priv ||
+          global_system_variables.max_user_connections) &&
+         get_or_create_user_conn(thd,
+           (opt_old_style_user_limits ? sctx->user : sctx->priv_user),
+diff -urNad mysql-5.5.20.raw/sql/sql_acl.h mysql-5.5.20.new/sql/sql_acl.h
+--- mysql-5.5.20.raw/sql/sql_acl.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_acl.h	2012-07-30 17:13:17.000000000 +0800
+@@ -178,6 +178,7 @@
+ bool hostname_requires_resolving(const char *hostname);
+ my_bool  acl_init(bool dont_read_acl_tables);
+ my_bool acl_reload(THD *thd);
++my_bool acl_profiler_record(THD *thd);
+ void acl_free(bool end=0);
+ ulong acl_get(const char *host, const char *ip,
+ 	      const char *user, const char *db, my_bool db_is_pattern);
+diff -urNad mysql-5.5.20.raw/sql/sql_class.cc mysql-5.5.20.new/sql/sql_class.cc
+--- mysql-5.5.20.raw/sql/sql_class.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_class.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -845,6 +845,11 @@
+   command=COM_CONNECT;
+   *scramble= '\0';
+ 
++  mem_size = 0;
++  max_mem_size = 0;
++  conn_cpu_times_per_trx = 0;
++  trx_start_thread_times = 0;
++  conn_io_reads_per_trx = 0;
+   /* Call to init() below requires fully initialized Open_tables_state. */
+   reset_open_tables_state(this);
+ 
+@@ -859,7 +864,7 @@
+ 
+   sp_proc_cache= NULL;
+   sp_func_cache= NULL;
+-
++  error = 0;
+   /* For user vars replication*/
+   if (opt_bin_log)
+     my_init_dynamic_array(&user_var_events,
+diff -urNad mysql-5.5.20.raw/sql/sql_class.h mysql-5.5.20.new/sql/sql_class.h
+--- mysql-5.5.20.raw/sql/sql_class.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_class.h	2012-07-30 17:13:17.000000000 +0800
+@@ -1958,6 +1958,14 @@
+   */
+   ha_rows    examined_row_count;
+ 
++  size_t	 mem_size;
++  size_t	 max_mem_size;
++  ulonglong  conn_cpu_times_per_trx;
++  ulonglong  trx_start_thread_times;
++  ulonglong  conn_io_reads_per_trx;
++
++  int		error;
++
+   USER_CONN *user_connect;
+   CHARSET_INFO *db_charset;
+   Warning_info *warning_info;
+diff -urNad mysql-5.5.20.raw/sql/sql_connect.cc mysql-5.5.20.new/sql/sql_connect.cc
+--- mysql-5.5.20.raw/sql/sql_connect.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_connect.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -62,6 +62,7 @@
+ 
+ #ifndef NO_EMBEDDED_ACCESS_CHECKS
+ static HASH hash_user_connections;
++static HASH hash_curr_resources;
+ 
+ int get_or_create_user_conn(THD *thd, const char *user,
+                             const char *host,
+@@ -95,7 +96,8 @@
+     uc->host= uc->user + user_len +  1;
+     uc->len= temp_len;
+     uc->connections= uc->questions= uc->updates= uc->conn_per_hour= 0;
+-    uc->user_resources= *mqh;
++    uc->curr_resources = get_or_create_curr_resources(user,host,mqh->curr_cpu_times, mqh->curr_io_reads);
++	uc->user_resources= *mqh;
+     uc->reset_utime= thd->thr_create_utime;
+     if (my_hash_insert(&hash_user_connections, (uchar*) uc))
+     {
+@@ -611,7 +613,11 @@
+   plugin_thdvar_cleanup(thd);
+   if (thd->user_connect)
+   {
+-    decrease_user_connections(thd->user_connect);
++	if(opt_profiler_record == 1)
++	{
++	  acl_profiler_record(thd);
++	}
++	decrease_user_connections(thd->user_connect);
+     /*
+       The thread may returned back to the pool and assigned to a user
+       that doesn't have a limit. Ensure the user is not using resources
+@@ -805,4 +811,68 @@
+     thd->thread_stack= (char*) &thd;
+   }
+ }
++
++extern "C" uchar *get_key_curr_resources(struct curr_resources *buff, size_t *length,
++	my_bool not_used __attribute__((unused)))
++{
++	*length = buff->len;
++	return (uchar*)buff->user;
++}
++
++extern "C" void free_curr_resources(struct curr_resources *cr)
++{
++	my_free(cr);
++}
++
++void init_max_curr_resources(void)
++{
++	(void)my_hash_init(&hash_curr_resources, system_charset_info,max_connections,
++	0, 0, (my_hash_get_key)get_key_curr_resources, (my_hash_free_key)free_curr_resources,0);
++}
++
++void free_max_curr_resources(void)
++{
++	my_hash_free(&hash_curr_resources);
++}
++
++struct curr_resources *get_or_create_curr_resources(const char *user, const char *host,
++										ulonglong curr_cpu_times, ulonglong curr_io_reads)
++{
++	size_t temp_len, user_len;
++	char temp_user[USER_HOST_BUFF_SIZE];
++	struct curr_resources *cr;
++
++	DBUG_ASSERT(user != 0);
++	DBUG_ASSERT(host != 0);
++
++	user_len = strlen(user);
++	temp_len = (strmov(strmov(temp_user, user)+1, host) - temp_user) + 1;
++	mysql_mutex_lock(&LOCK_curr_resources);
++	if (!(cr = (struct curr_resources *) my_hash_search(&hash_curr_resources,
++		(uchar*)temp_user, temp_len)))
++	{
++		if (!(cr = ((struct curr_resources*)
++			my_malloc(sizeof(struct curr_resources) + temp_len + 1,
++			MYF(MY_WME)))))
++		{
++			cr = NULL;
++			goto end;
++		}
++		cr->user = (char*)(cr + 1);
++		memcpy(cr->user, temp_user, temp_len + 1);
++		cr->host = cr->user + user_len + 1;
++		cr->len = temp_len;
++		cr->curr_cpu_times = curr_cpu_times;
++		cr->curr_io_reads = curr_io_reads;
++		if(my_hash_insert(&hash_curr_resources, (uchar*)cr))
++		{
++			my_free(cr);
++			cr = NULL;
++			goto end;
++		}
++	}
++end:
++	mysql_mutex_unlock(&LOCK_curr_resources);
++	return cr;
++}
+ #endif /* EMBEDDED_LIBRARY */
+diff -urNad mysql-5.5.20.raw/sql/sql_connect.h mysql-5.5.20.new/sql/sql_connect.h
+--- mysql-5.5.20.raw/sql/sql_connect.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_connect.h	2012-07-30 17:13:17.000000000 +0800
+@@ -23,6 +23,12 @@
+ typedef struct st_lex_user LEX_USER;
+ typedef struct user_conn USER_CONN;
+ 
++void init_max_curr_resources(void);
++void free_max_curr_resources(void);
++struct curr_resources *
++get_or_create_curr_resources(const char *user, const char* host,
++							ulonglong curr_cpu_times,ulonglong curr_io_reads);
++
+ void init_max_user_conn(void);
+ void free_max_user_conn(void);
+ 
+diff -urNad mysql-5.5.20.raw/sql/sql_insert.cc mysql-5.5.20.new/sql/sql_insert.cc
+--- mysql-5.5.20.raw/sql/sql_insert.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_insert.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -1741,6 +1741,12 @@
+     goto ok_or_after_trg_err;
+   }
+ 
++  if(thd->error)
++  {
++	error = thd->error;
++	goto err;
++  }
++
+ after_trg_n_copied_inc:
+   info->copied++;
+   thd->record_first_successful_insert_id_in_cur_stmt(table->file->insert_id_for_cur_row);
+diff -urNad mysql-5.5.20.raw/sql/sql_parse.cc mysql-5.5.20.new/sql/sql_parse.cc
+--- mysql-5.5.20.raw/sql/sql_parse.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_parse.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -94,6 +94,7 @@
+ #include "debug_sync.h"
+ #include "probes_mysql.h"
+ #include "set_var.h"
++#include "resource_profiler.h"
+ 
+ #define FLAGSTR(V,F) ((V)&(F)?#F" ":"")
+ 
+@@ -1413,6 +1414,8 @@
+ 
+   log_slow_statement(thd);
+ 
++  curr_profiler_record(thd);
++
+   thd_proc_info(thd, "cleaning up");
+   thd->reset_query();
+   thd->command=COM_SLEEP;
+@@ -1437,6 +1440,20 @@
+   DBUG_RETURN(error);
+ }
+ 
++void curr_profiler_record(THD *thd)
++{
++  DBUG_ENTER("curr_profiler_record");
++
++  if(unlikely(thd->in_sub_stmt))
++	DBUG_VOID_RETURN;
++
++  if(opt_profiler_record == 2)
++  {
++	thd_proc_info(thd, "record current profiler");
++	acl_profiler_record(thd);
++  }
++  DBUG_VOID_RETURN;
++}
+ 
+ void log_slow_statement(THD *thd)
+ {
+@@ -2041,6 +2058,16 @@
+ #ifdef HAVE_REPLICATION
+   } /* endif unlikely slave */
+ #endif
++  for (TABLE_LIST *table=all_tables; table; table=table->next_global)
++  {
++	if ((strcmp(thd->security_ctx->priv_user,"") != 0 && strcmp(thd->security_ctx->priv_host,"") != 0)
++		&& strcmp(table->db,"mysql") == 0 && strcmp(table->table_name,"user_profiler") == 0 
++		&&(thd->user_connect == NULL || ! thd->user_connect->user_resources.operate_priv))
++	{
++	  my_error(ER_PROFILER_ACCESS_DENIED, MYF(0),thd->security_ctx->priv_user, thd->security_ctx->priv_host);
++	  DBUG_RETURN(-1);
++	}
++  }
+ 
+   status_var_increment(thd->status_var.com_stat[lex->sql_command]);
+ 
+@@ -2073,6 +2100,9 @@
+     DEBUG_SYNC(thd,"before_execute_sql_command");
+ #endif
+ 
++  start_trx_statistics(thd);
++
++
+   switch (lex->sql_command) {
+ 
+   case SQLCOM_SHOW_EVENTS:
+@@ -4456,6 +4486,7 @@
+   DBUG_ASSERT(!thd->in_active_multi_stmt_transaction() ||
+                thd->in_multi_stmt_transaction_mode());
+ 
++  //end_trx_statistics(thd);
+ 
+   if (! thd->in_sub_stmt)
+   {
+@@ -4480,6 +4511,8 @@
+       thd->stmt_da->can_overwrite_status= FALSE;
+     }
+   }
++  if(thd->error && thd->killed)
++	thd->killed = THD::NOT_KILLED;
+ 
+   lex->unit.cleanup();
+   /* Free tables */
+diff -urNad mysql-5.5.20.raw/sql/sql_parse.h mysql-5.5.20.new/sql/sql_parse.h
+--- mysql-5.5.20.raw/sql/sql_parse.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_parse.h	2012-07-30 17:13:17.000000000 +0800
+@@ -99,6 +99,7 @@
+ bool dispatch_command(enum enum_server_command command, THD *thd,
+ 		      char* packet, uint packet_length);
+ void log_slow_statement(THD *thd);
++void curr_profiler_record(THD *thd);
+ bool append_file_to_dir(THD *thd, const char **filename_ptr,
+                         const char *table_name);
+ bool append_file_to_dir(THD *thd, const char **filename_ptr,
+diff -urNad mysql-5.5.20.raw/sql/sql_truncate.cc mysql-5.5.20.new/sql/sql_truncate.cc
+--- mysql-5.5.20.raw/sql/sql_truncate.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_truncate.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -516,7 +516,13 @@
+     DBUG_RETURN(res);
+ 
+   if (! (res= truncate_table(thd, first_table)))
++  {
++	if(thd->error)
++	{
++	  thd->clear_error();
++	}
+     my_ok(thd);
++  }
+ 
+   DBUG_RETURN(res);
+ }
+diff -urNad mysql-5.5.20.raw/sql/structs.h mysql-5.5.20.new/sql/structs.h
+--- mysql-5.5.20.raw/sql/structs.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/structs.h	2012-07-30 17:13:17.000000000 +0800
+@@ -159,6 +159,14 @@
+   LEX_STRING user, host, password, plugin, auth;
+ } LEX_USER;
+ 
++typedef struct curr_resources
++{
++  char *user;
++  char *host;
++  uint len;
++  ulonglong curr_cpu_times;
++  ulonglong curr_io_reads;
++}CURR_RESOURCES;
+ /*
+   This structure specifies the maximum amount of resources which
+   can be consumed by each account. Zero value of a member means
+@@ -176,6 +184,23 @@
+   uint conn_per_hour;
+   /* Maximum number of concurrent connections. */
+   uint user_conn;
++
++  ulonglong cpu_times;
++
++  ulonglong curr_cpu_times;
++
++  ulonglong io_reads;
++
++  ulonglong curr_io_reads;
++
++  ulonglong cpu_times_per_trx;
++
++  ulonglong io_reads_per_trx;
++
++  size_t	mem_size;
++
++  bool operate_priv;
++
+   /*
+      Values of this enum and specified_limits member are used by the
+      parser to store which user limits were specified in GRANT statement.
+@@ -214,6 +239,8 @@
+      per hour and total number of statements per hour for this account.
+   */
+   uint conn_per_hour, updates, questions;
++
++  CURR_RESOURCES *curr_resources; 
+   /* Maximum amount of resources which account is allowed to consume. */
+   USER_RESOURCES user_resources;
+ } USER_CONN;
+diff -urNad mysql-5.5.20.raw/sql/sys_vars.cc mysql-5.5.20.new/sql/sys_vars.cc
+--- mysql-5.5.20.raw/sql/sys_vars.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sys_vars.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -2964,6 +2964,12 @@
+        DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+        ON_UPDATE(fix_log_state));
+ 
++static Sys_var_uint Sys_current_profiler_record(
++	"current_profiler_record",
++	"record the current profiler info into the user_profiler",
++	GLOBAL_VAR(opt_profiler_record), CMD_LINE(OPT_ARG),
++	VALID_RANGE(0, 2), DEFAULT(0), BLOCK_SIZE(1));
++
+ /* Synonym of "slow_query_log" for consistency with SHOW VARIABLES output */
+ static Sys_var_mybool Sys_log_slow(
+        "log_slow_queries",
+diff -urNad mysql-5.5.20.raw/storage/innobase/buf/buf0buf.c mysql-5.5.20.new/storage/innobase/buf/buf0buf.c
+--- mysql-5.5.20.raw/storage/innobase/buf/buf0buf.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/buf/buf0buf.c	2012-08-01 10:48:07.000000000 +0800
+@@ -51,7 +51,7 @@
+ #include "dict0dict.h"
+ #include "log0recv.h"
+ #include "page0zip.h"
+-
++#include "resource_prof.h"
+ /*
+ 		IMPLEMENTATION OF THE BUFFER POOL
+ 		=================================
+@@ -240,6 +240,8 @@
+ the read requests for the whole area.
+ */
+ 
++_resource_profiler_func_ptr resource_profiler_func_ptr;
++
+ #ifndef UNIV_HOTBACKUP
+ /** Value in microseconds */
+ static const int WAIT_FOR_READ	= 5000;
+@@ -2496,7 +2498,7 @@
+ 		ut_error;
+ 		break;
+ 	}
+-
++	resource_profiler_func_ptr(1);
+ 	ut_ad(buf_block_get_state(block) == BUF_BLOCK_FILE_PAGE);
+ 
+ 	mutex_enter(&block->mutex);
+@@ -2737,6 +2739,7 @@
+ 			    buf_block_get_page_no(block)) == 0);
+ #endif
+ 	buf_pool = buf_pool_from_block(block);
++	resource_profiler_func_ptr(1);
+ 	buf_pool->stat.n_page_gets++;
+ 
+ 	return(TRUE);
+@@ -2841,6 +2844,7 @@
+ 	     || (ibuf_count_get(buf_block_get_space(block),
+ 				buf_block_get_page_no(block)) == 0));
+ #endif
++	resource_profiler_func_ptr(1);
+ 	buf_pool->stat.n_page_gets++;
+ 
+ 	return(TRUE);
+diff -urNad mysql-5.5.20.raw/storage/innobase/handler/ha_innodb.cc mysql-5.5.20.new/storage/innobase/handler/ha_innodb.cc
+--- mysql-5.5.20.raw/storage/innobase/handler/ha_innodb.cc	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/handler/ha_innodb.cc	2012-07-30 17:13:17.000000000 +0800
+@@ -90,6 +90,7 @@
+ 
+ #include "ha_innodb.h"
+ #include "i_s.h"
++#include "resource_prof.h"
+ 
+ # ifndef MYSQL_PLUGIN_IMPORT
+ #  define MYSQL_PLUGIN_IMPORT /* nothing */
+@@ -2242,6 +2243,7 @@
+         innobase_hton->flags=HTON_NO_FLAGS;
+         innobase_hton->release_temporary_latches=innobase_release_temporary_latches;
+ 	innobase_hton->alter_table_flags = innobase_alter_table_flags;
++	    resource_profiler_func_ptr = innobase_hton->resource_profiler_ptr;
+ 
+ 	ut_a(DATA_MYSQL_TRUE_VARCHAR == (ulint)MYSQL_TYPE_VARCHAR);
+ 
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/resource_prof.h mysql-5.5.20.new/storage/innobase/include/resource_prof.h
+--- mysql-5.5.20.raw/storage/innobase/include/resource_prof.h	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/resource_prof.h	2012-08-01 10:45:54.000000000 +0800
+@@ -0,0 +1,15 @@
++#ifndef __RESOURCE_PROF__
++#define __RESOURCE_PROF__
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++
++	typedef int (*_resource_profiler_func_ptr)(int with_io_read);
++	extern _resource_profiler_func_ptr resource_profiler_func_ptr;
++
++#ifdef __cplusplus
++}; 
++#endif
++#endif

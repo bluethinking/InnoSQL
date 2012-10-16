@@ -1,0 +1,1792 @@
+diff -urNad mysql-5.5.20.raw/storage/innobase/CMakeLists.txt mysql-5.5.20.new/storage/innobase/CMakeLists.txt
+--- mysql-5.5.20.raw/storage/innobase/CMakeLists.txt	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/CMakeLists.txt	2012-04-20 11:10:38.000000000 +0800
+@@ -215,7 +215,7 @@
+ ENDIF()
+ 
+ SET(INNOBASE_SOURCES	btr/btr0btr.c btr/btr0cur.c btr/btr0pcur.c btr/btr0sea.c
+-			buf/buf0buddy.c buf/buf0buf.c buf/buf0flu.c buf/buf0lru.c buf/buf0rea.c
++			buf/buf0buddy.c buf/buf0buf.c buf/buf0dump.c buf/buf0flu.c buf/buf0lru.c buf/buf0rea.c
+ 			data/data0data.c data/data0type.c
+ 			dict/dict0boot.c dict/dict0crea.c dict/dict0dict.c dict/dict0load.c dict/dict0mem.c
+ 			dyn/dyn0dyn.c
+diff -urNad mysql-5.5.20.raw/storage/innobase/buf/buf0buf.c mysql-5.5.20.new/storage/innobase/buf/buf0buf.c
+--- mysql-5.5.20.raw/storage/innobase/buf/buf0buf.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/buf/buf0buf.c	2012-04-20 15:07:25.000000000 +0800
+@@ -304,6 +304,9 @@
+ };
+ #endif /* !UNIV_HOTBACKUP */
+ 
++extern ibool srv_use_shm_preload;
++extern ib_uint64_t srv_start_lsn;
++static ibool srv_shm_exist = FALSE;
+ /********************************************************************//**
+ Gets the smallest oldest_modification lsn for any page in the pool. Returns
+ zero if all modified pages have been flushed to disk.
+@@ -926,6 +929,26 @@
+ }
+ 
+ /********************************************************************//**
++******************/
++static 
++ibool   
++is_lru_page_from_shm(const buf_page_t *bpage)
++{
++	ulint type;
++	ib_uint64_t lsn;
++	buf_block_t *block = (buf_block_t*)bpage;
++	byte *frame = block->frame;
++	lsn = mach_read_from_8(frame + FIL_PAGE_LSN);
++	type = mach_read_from_2(frame + FIL_PAGE_TYPE);
++
++	if(lsn == 0 || lsn > srv_start_lsn || type != FIL_PAGE_INDEX || buf_page_is_corrupted(frame,buf_page_get_zip_size(bpage)))
++	{
++		return FALSE;
++	}
++	return TRUE;
++}
++
++/********************************************************************//**
+ Allocates a chunk of buffer frames.
+ @return	chunk, or NULL on failure */
+ static
+@@ -948,7 +971,15 @@
+ 				  + (UNIV_PAGE_SIZE - 1), UNIV_PAGE_SIZE);
+ 
+ 	chunk->mem_size = mem_size;
+-	chunk->mem = os_mem_alloc_large(&chunk->mem_size);
++	if(srv_use_shm_preload)
++	{
++		chunk->mem = os_mem_alloc_shm(&chunk->mem_size, &srv_shm_exist);
++	}
++	else
++	{
++		del_shm_not_use();
++		chunk->mem = os_mem_alloc_large(&chunk->mem_size);
++	}
+ 
+ 	if (UNIV_UNLIKELY(chunk->mem == NULL)) {
+ 
+@@ -987,12 +1018,17 @@
+ 	block = chunk->blocks;
+ 
+ 	for (i = chunk->size; i--; ) {
+-
++		ulint old = block->page.old;
++		memset(block,'\0', sizeof(*block));
++		block->page.old = old;
+ 		buf_block_init(buf_pool, block, frame);
+ 
+ #ifdef HAVE_purify
+ 		/* Wipe contents of frame to eliminate a Purify warning */
+-		memset(block->frame, '\0', UNIV_PAGE_SIZE);
++		if(!srv_shm_exist)
++		{
++			memset(block->frame, '\0', UNIV_PAGE_SIZE);
++		}
+ #endif
+ 		/* Add the block to the free list */
+ 		UT_LIST_ADD_LAST(list, buf_pool->free, (&block->page));
+@@ -1168,7 +1204,7 @@
+ 		buf_pool->chunks = chunk = mem_zalloc(sizeof *chunk);
+ 
+ 		UT_LIST_INIT(buf_pool->free);
+-
++		UT_LIST_INIT(buf_pool->LRU);
+ 		if (!buf_chunk_init(buf_pool, chunk, buf_pool_size)) {
+ 			mem_free(chunk);
+ 			mem_free(buf_pool);
+@@ -3052,7 +3088,8 @@
+ 				/*!< in: prevents reading from a wrong
+ 				version of the tablespace in case we have done
+ 				DISCARD + IMPORT */
+-	ulint		offset)	/*!< in: page number */
++	ulint		offset,/*!< in: page number */
++	ibool		old)	
+ {
+ 	buf_block_t*	block;
+ 	buf_page_t*	bpage	= NULL;
+@@ -3131,7 +3168,7 @@
+ 		buf_page_init(buf_pool, space, offset, fold, block);
+ 
+ 		/* The block must be put to the LRU list, to the old blocks */
+-		buf_LRU_add_block(bpage, TRUE/* to old blocks */);
++		buf_LRU_add_block(bpage, old/* to old blocks */);
+ 
+ 		/* We set a pass-type x-lock on the frame because then
+ 		the same thread which called for the read operation
+@@ -3167,7 +3204,7 @@
+ 			we have to add this block to unzip_LRU
+ 			after block->page.zip.data is set. */
+ 			ut_ad(buf_page_belongs_to_unzip_LRU(&block->page));
+-			buf_unzip_LRU_add_block(block, TRUE);
++			buf_unzip_LRU_add_block(block, old);
+ 		}
+ 
+ 		mutex_exit(&block->mutex);
+@@ -3241,7 +3278,7 @@
+ 			    bpage);
+ 
+ 		/* The block must be put to the LRU list, to the old blocks */
+-		buf_LRU_add_block(bpage, TRUE/* to old blocks */);
++		buf_LRU_add_block(bpage, old/* to old blocks */);
+ #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
+ 		buf_LRU_insert_zip_clean(bpage);
+ #endif /* UNIV_DEBUG || UNIV_BUF_DEBUG */
+@@ -3779,6 +3816,52 @@
+ 	buf_pool_mutex_exit(buf_pool);
+ }
+ 
++/********************************************************************//**
++if use the shm,init the LRU list when mysql is startted*/
++static
++void
++buf_pool_init_LRU_block_instance(buf_pool_t* buf_pool)
++{
++	ulint i;
++	ulint fold;
++	buf_chunk_t *chunk = buf_pool->chunks;
++	buf_block_t *block = chunk->blocks;
++	if(srv_shm_exist)
++	{
++		int precent = 0,size_pre_precent = chunk->size / 99, count = 0;
++		ut_print_timestamp(stderr);
++		fprintf(stderr," InnoDB: load shm data");
++		for(i = chunk->size; i--; )
++		{
++			byte *frame = block->frame;
++			ulint space = mach_read_from_4(frame + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
++			ulint offset = mach_read_from_4(frame + FIL_PAGE_OFFSET);
++			if(is_lru_page_from_shm(&(block->page)))
++			{
++				ut_ad(block->page.in_free_list == TRUE);
++				UT_LIST_REMOVE(list, buf_pool->free, (&block->page));
++				block->page.space = space;
++				block->page.offset = offset;
++				block->page.state = BUF_BLOCK_FILE_PAGE;
++#ifdef UNIV_DEBUG
++				block->page.in_page_hash = TRUE;
++#endif
++				fold = buf_page_address_fold(block->page.space, block->page.offset);
++				HASH_INSERT(buf_page_t,hash,buf_pool->page_hash,fold,&block->page);
++				buf_LRU_add_block(&block->page,FALSE);
++				ut_d(block->page.in_LRU_list = TRUE);
++				ut_ad(buf_pool_from_block(block) == buf_pool);
++			}
++			if(++count == size_pre_precent)
++			{
++				fprintf(stderr," %d",++precent);
++				count = 0;
++			}
++			block++;
++		}
++		fprintf(stderr," %d\n",++precent);
++	}
++}
+ /*********************************************************************//**
+ Invalidates the file pages in the buffer pool when an archive recovery is
+ completed. All the file pages buffered must be in a replaceable state when
+@@ -3795,6 +3878,17 @@
+ 	}
+ }
+ 
++UNIV_INTERN
++void
++buf_pool_init_LRU_block(void)
++{
++	ulint   i;
++
++	for (i = 0; i < srv_buf_pool_instances; i++) {
++		buf_pool_init_LRU_block_instance(buf_pool_from_array(i));
++	}
++}
++
+ #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
+ /*********************************************************************//**
+ Validates data in one buffer pool instance
+diff -urNad mysql-5.5.20.raw/storage/innobase/buf/buf0dump.c mysql-5.5.20.new/storage/innobase/buf/buf0dump.c
+--- mysql-5.5.20.raw/storage/innobase/buf/buf0dump.c	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/buf/buf0dump.c	2012-04-20 14:14:12.000000000 +0800
+@@ -0,0 +1,604 @@
++/*****************************************************************************
++
++Copyright (c) 2011, 2011, Oracle and/or its affiliates. All Rights Reserved.
++
++This program is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free Software
++Foundation; version 2 of the License.
++
++This program is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License along with
++this program; if not, write to the Free Software Foundation, Inc.,
++51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
++
++*****************************************************************************/
++
++/**************************************************//**
++@file buf/buf0dump.cc
++Implements a buffer pool dump/load.
++
++Created April 08, 2011 Vasil Dimov
++*******************************************************/
++
++#include <stdarg.h> /* va_* */
++#include <string.h> /* strerror() */
++
++#include "univ.i"
++
++#include "buf0buf.h" /* buf_pool_mutex_enter(), srv_buf_pool_instances */
++#include "buf0dump.h"
++#include "db0err.h" /* enum db_err */
++#include "dict0dict.h" /* dict_operation_lock */
++#include "os0file.h" /* OS_FILE_MAX_PATH */
++#include "os0sync.h" /* os_event* */
++#include "os0thread.h" /* os_thread_* */
++#include "srv0srv.h" /* srv_fast_shutdown, srv_buf_dump* */
++#include "srv0start.h" /* srv_shutdown_state */
++#include "sync0rw.h" /* rw_lock_s_lock() */
++#include "ut0byte.h" /* ut_ull_create() */
++#include "ut0sort.h" /* UT_SORT_FUNCTION_BODY */
++#include "buf0rea.h"
++
++enum status_severity {
++	STATUS_INFO,
++	STATUS_NOTICE,
++	STATUS_ERR
++};
++
++#define SHUTTING_DOWN()	(UNIV_UNLIKELY(srv_shutdown_state \
++				       != SRV_SHUTDOWN_NONE))
++
++static ibool	buf_dump_should_start = FALSE;
++static ibool	buf_load_should_start = FALSE;
++/* Used to temporary store dump info in order to avoid IO while holding
++buffer pool mutex during dump and also to sort the contents of the dump
++before reading the pages from disk during load.
++We store the space id in the high 32 bits and page no in low 32 bits. */
++/*typedef ib_uint64_t	buf_dump_t; */
++
++/* Aux macros to create buf_dump_t and to extract space and page from it */
++#define BUF_DUMP_CREATE(space, page)	ut_ull_create(space, page)
++#define BUF_DUMP_SPACE(a)		((ulint) ((a) >> 32))
++#define BUF_DUMP_PAGE(a)		((ulint) ((a) & 0xFFFFFFFFUL))
++
++/*****************************************************************//**
++Wakes up the buffer pool dump/load thread and instructs it to start
++a dump. This function is called by MySQL code via buffer_pool_dump_now()
++and it should return immediately because the whole MySQL is frozen during
++its execution. */
++UNIV_INTERN
++void
++buf_dump_start()
++/*============*/
++{
++	buf_dump_should_start = TRUE;
++	os_event_set(srv_buf_dump_event);
++}
++
++UNIV_INTERN
++void
++buf_load_start()
++{
++	buf_load_should_start = TRUE;
++	os_event_set(srv_buf_dump_event);
++}
++
++/*****************************************************************//**
++Sets the global variable that feeds MySQL's innodb_buffer_pool_dump_status
++to the specified string. The format and the following parameters are the
++same as the ones used for printf(3). The value of this variable can be
++retrieved by:
++SELECT variable_value FROM information_schema.global_status WHERE
++variable_name = 'INNODB_BUFFER_POOL_DUMP_STATUS';
++or by:
++SHOW STATUS LIKE 'innodb_buffer_pool_dump_status'; */
++static __attribute__((nonnull, format(printf, 2, 3)))
++void
++buf_dump_status(
++/*============*/
++	enum status_severity	severity,/*!< in: status severity */
++	const char*		fmt,	/*!< in: format */
++	...)				/*!< in: extra parameters according
++					to fmt */
++{
++	va_list	ap;
++
++	va_start(ap, fmt);
++
++	ut_vsnprintf(
++		export_vars.innodb_buffer_pool_dump_status,
++		sizeof(export_vars.innodb_buffer_pool_dump_status),
++		fmt, ap);
++
++	if (severity == STATUS_NOTICE || severity == STATUS_ERR) {
++		ut_print_timestamp(stderr);
++		fprintf(stderr, " InnoDB: %s\n",
++			export_vars.innodb_buffer_pool_dump_status);
++	}
++
++	va_end(ap);
++}
++
++/*****************************************************************//**
++Sets the global variable that feeds MySQL's innodb_buffer_pool_load_status
++to the specified string. The format and the following parameters are the
++same as the ones used for printf(3). The value of this variable can be
++retrieved by:
++SELECT variable_value FROM information_schema.global_status WHERE
++variable_name = 'INNODB_BUFFER_POOL_LOAD_STATUS';
++or by:
++SHOW STATUS LIKE 'innodb_buffer_pool_load_status'; */
++static __attribute__((nonnull, format(printf, 2, 3)))
++void
++buf_load_status(
++/*============*/
++	enum status_severity	severity,/*!< in: status severity */
++	const char*	fmt,	/*!< in: format */
++	...)			/*!< in: extra parameters according to fmt */
++{
++	va_list	ap;
++
++	va_start(ap, fmt);
++
++	ut_vsnprintf(
++		export_vars.innodb_buffer_pool_load_status,
++		sizeof(export_vars.innodb_buffer_pool_load_status),
++		fmt, ap);
++
++	if (severity == STATUS_NOTICE || severity == STATUS_ERR) {
++		ut_print_timestamp(stderr);
++		fprintf(stderr, " InnoDB: %s\n",
++			export_vars.innodb_buffer_pool_load_status);
++	}
++
++	va_end(ap);
++}
++
++/*****************************************************************//**
++Perform a buffer pool dump into the file specified by
++innodb_buffer_pool_filename. If any errors occur then the value of
++innodb_buffer_pool_dump_status will be set accordingly, see buf_dump_status().
++The dump filename can be specified by (relative to srv_data_home):
++SET GLOBAL innodb_buffer_pool_filename='filename'; */
++static
++void
++buf_dump(
++/*=====*/
++	ibool	obey_shutdown)	/*!< in: quit if we are in a shutting down
++				state */
++{
++#define SHOULD_QUIT()	(SHUTTING_DOWN() && obey_shutdown)
++
++	char	full_filename[OS_FILE_MAX_PATH];
++	char	tmp_filename[OS_FILE_MAX_PATH];
++	char	now[32];
++	FILE*	f;
++	ulint	i;
++	int	ret;
++
++	ut_snprintf(full_filename, sizeof(full_filename),
++		    "%s%c%s", srv_data_home, SRV_PATH_SEPARATOR,
++		    srv_buf_dump_filename);
++
++	ut_snprintf(tmp_filename, sizeof(tmp_filename),
++		    "%s.incomplete", full_filename);
++
++	buf_dump_status(STATUS_NOTICE, "Dumping buffer pool(s) to %s",
++			full_filename);
++
++	f = fopen(tmp_filename, "w");
++	if (f == NULL) {
++		buf_dump_status(STATUS_ERR,
++				"Cannot open '%s' for writing: %s",
++				tmp_filename, strerror(errno));
++		return;
++	}
++	/* else */
++
++	/* walk through each buffer pool */
++	for (i = 0; i < srv_buf_pool_instances && !SHOULD_QUIT(); i++) {
++		buf_pool_t*		buf_pool;
++		const buf_page_t*	bpage;
++		buf_dump_t*		dump;
++		ulint			n_pages;
++		ulint			j;
++
++		buf_pool = buf_pool_from_array(i);
++
++		/* obtain buf_pool mutex before allocate, since
++		UT_LIST_GET_LEN(buf_pool->LRU) could change */
++		buf_pool_mutex_enter(buf_pool);
++
++		n_pages = UT_LIST_GET_LEN(buf_pool->LRU);
++
++		/* skip empty buffer pools */
++		if (n_pages == 0) {
++			buf_pool_mutex_exit(buf_pool);
++			continue;
++		}
++
++		dump = (buf_dump_t*)ut_malloc(n_pages * sizeof(*dump));
++
++		if (dump == NULL) {
++			buf_pool_mutex_exit(buf_pool);
++			fclose(f);
++			buf_dump_status(STATUS_ERR,
++					"Cannot allocate " ULINTPF " bytes: %s",
++					(ulint) (n_pages * sizeof(*dump)),
++					strerror(errno));
++			/* leave tmp_filename to exist */
++			return;
++		}
++
++		for (bpage = UT_LIST_GET_LAST(buf_pool->LRU), j = 0;
++		     bpage != NULL;
++		     bpage = UT_LIST_GET_PREV(LRU, bpage), j++) {
++
++			ut_a(buf_page_in_file(bpage));
++			/*
++			dump[j] = BUF_DUMP_CREATE(buf_page_get_space(bpage),
++						  buf_page_get_page_no(bpage));
++			*/
++			dump[j].space = buf_page_get_space(bpage);
++			dump[j].offset = buf_page_get_page_no(bpage);
++			dump[j].old = bpage->old;
++		}
++
++		ut_a(j == n_pages);
++
++		buf_pool_mutex_exit(buf_pool);
++
++		for (j = 0; j < n_pages && !SHOULD_QUIT(); j++) {
++			/*
++			ret = fprintf(f, ULINTPF "," ULINTPF "\n",
++				      BUF_DUMP_SPACE(dump[j]),
++				      BUF_DUMP_PAGE(dump[j]));
++					  */
++			ret = fprintf(f, ULINTPF "," ULINTPF "," ULINTPF "\n", dump[j].space,dump[j].offset,dump[j].old);
++
++			if (ret < 0) {
++				ut_free(dump);
++				fclose(f);
++				buf_dump_status(STATUS_ERR,
++						"Cannot write to '%s': %s",
++						tmp_filename, strerror(errno));
++				/* leave tmp_filename to exist */
++				return;
++			}
++
++			if (j % 128 == 0) {
++				buf_dump_status(
++					STATUS_INFO,
++					"Dumping buffer pool "
++					ULINTPF "/" ULINTPF ", "
++					"page " ULINTPF "/" ULINTPF,
++					i + 1, srv_buf_pool_instances,
++					j + 1, n_pages);
++			}
++		}
++
++		ut_free(dump);
++	}
++
++	ret = fclose(f);
++	if (ret != 0) {
++		buf_dump_status(STATUS_ERR,
++				"Cannot close '%s': %s",
++				tmp_filename, strerror(errno));
++		return;
++	}
++	/* else */
++
++	ret = unlink(full_filename);
++	if (ret != 0 && errno != ENOENT) {
++		buf_dump_status(STATUS_ERR,
++				"Cannot delete '%s': %s",
++				full_filename, strerror(errno));
++		/* leave tmp_filename to exist */
++		return;
++	}
++	/* else */
++
++	ret = rename(tmp_filename, full_filename);
++	if (ret != 0) {
++		buf_dump_status(STATUS_ERR,
++				"Cannot rename '%s' to '%s': %s",
++				tmp_filename, full_filename,
++				strerror(errno));
++		/* leave tmp_filename to exist */
++		return;
++	}
++	/* else */
++
++	/* success */
++
++	ut_sprintf_timestamp(now);
++
++	buf_dump_status(STATUS_NOTICE,
++			"Buffer pool(s) dump completed at %s", now);
++}
++
++/*****************************************************************//**
++Compare two buffer pool dump entries, used to sort the dump on
++space_no,page_no before loading in order to increase the chance for
++sequential IO.
++@return -1/0/1 if entry 1 is smaller/equal/bigger than entry 2 */
++/*
++static
++lint
++buf_dump_cmp(
++	const buf_dump_t	d1,	
++	const buf_dump_t	d2)	
++{
++	if (d1 < d2) {
++		return(-1);
++	} else if (d1 == d2) {
++		return(0);
++	} else {
++		return(1);
++	}
++}
++*/
++
++static
++int
++buf_dump_cmp(
++/*=========*/
++	const void*	a,	/*!< in: buffer pool dump entry 1 */
++	const void*	b)	/*!< in: buffer pool dump entry 2 */
++{
++	const buf_dump_t *d1 = (buf_dump_t*)a;
++	const buf_dump_t *d2 = (buf_dump_t*)b;
++
++	if(d1->space < d2->space)
++		return -1;
++	if(d1->space > d2->space)
++		return 1;
++	if(d1->offset < d2->offset)
++		return -1;
++	return d1->offset > d2->offset;
++}
++/*****************************************************************//**
++Sort a buffer pool dump on space_no, page_no. */
++static
++void
++buf_dump_sort(
++/*==========*/
++	buf_dump_t*	dump,	/*!< in/out: buffer pool dump to sort */
++	buf_dump_t*	tmp,	/*!< in/out: temp storage */
++	ulint		low,	/*!< in: lowest index (inclusive) */
++	ulint		high)	/*!< in: highest index (non-inclusive) */
++{
++	/* use qsort instead of this function
++	UT_SORT_FUNCTION_BODY(buf_dump_sort, dump, tmp, low, high,
++			      buf_dump_cmp);
++	*/
++}
++
++/*****************************************************************//**
++Perform a buffer pool load from the file specified by
++innodb_buffer_pool_filename. If any errors occur then the value of
++innodb_buffer_pool_load_status will be set accordingly, see buf_load_status().
++The dump filename can be specified by (relative to srv_data_home):
++SET GLOBAL innodb_buffer_pool_filename='filename'; */
++static
++void
++buf_load()
++/*======*/
++{
++	char		full_filename[OS_FILE_MAX_PATH];
++	char		now[32];
++	FILE*		f;
++	buf_dump_t*	dump;
++	ulint		dump_n;
++	ulint		total_buffer_pools_pages;
++	ulint		i;
++	ulint		space_id;
++	ulint		page_no;
++	ulint		old;
++	int		fscanf_ret;
++
++	ut_snprintf(full_filename, sizeof(full_filename),
++		    "%s%c%s", srv_data_home, SRV_PATH_SEPARATOR,
++		    srv_buf_dump_filename);
++
++	buf_load_status(STATUS_NOTICE,
++			"Loading buffer pool(s) from %s", full_filename);
++
++	f = fopen(full_filename, "r");
++	if (f == NULL) {
++		buf_load_status(STATUS_ERR,
++				"Cannot open '%s' for reading: %s",
++				full_filename, strerror(errno));
++		return;
++	}
++	/* else */
++
++	/* First scan the file to estimate how many entries are in it.
++	This file is tiny (approx 500KB per 1GB buffer pool), reading it
++	two times is fine. */
++	dump_n = 0;
++	while (fscanf(f, ULINTPF "," ULINTPF "," ULINTPF, &space_id, &page_no, &old) == 3
++	       && !SHUTTING_DOWN()) {
++		dump_n++;
++	}
++
++	if (!SHUTTING_DOWN() && !feof(f)) {
++		/* fscanf() returned != 2 */
++		const char*	what;
++		if (ferror(f)) {
++			what = "reading";
++		} else {
++			what = "parsing";
++		}
++		fclose(f);
++		buf_load_status(STATUS_ERR, "Error %s '%s', "
++				"unable to load buffer pool (stage 1)",
++				what, full_filename);
++		return;
++	}
++
++	/* If dump is larger than the buffer pool(s), then we ignore the
++	extra trailing. This could happen if a dump is made, then buffer
++	pool is shrunk and then load it attempted. */
++	total_buffer_pools_pages = buf_pool_get_n_pages()
++		* srv_buf_pool_instances;
++	if (dump_n > total_buffer_pools_pages) {
++		dump_n = total_buffer_pools_pages;
++	}
++
++	dump = (buf_dump_t*)ut_malloc(dump_n * sizeof(*dump));
++
++	if (dump == NULL) {
++		fclose(f);
++		buf_load_status(STATUS_ERR,
++				"Cannot allocate " ULINTPF " bytes: %s",
++				(ulint) (dump_n * sizeof(*dump)),
++				strerror(errno));
++		return;
++	}
++
++	rewind(f);
++
++	for (i = 0; i < dump_n && !SHUTTING_DOWN(); i++) {
++		fscanf_ret = fscanf(f, ULINTPF "," ULINTPF "," ULINTPF,
++				    &space_id, &page_no, &old);
++
++		if (fscanf_ret != 3) {
++			if (feof(f)) {
++				break;
++			}
++			/* else */
++
++			ut_free(dump);
++			fclose(f);
++			buf_load_status(STATUS_ERR,
++					"Error parsing '%s', unable "
++					"to load buffer pool (stage 2)",
++					full_filename);
++			return;
++		}
++
++		if (space_id > ULINT32_MASK || page_no > ULINT32_MASK) {
++			ut_free(dump);
++			fclose(f);
++			buf_load_status(STATUS_ERR,
++					"Error parsing '%s': bogus "
++					"space,page " ULINTPF "," ULINTPF
++					" at line " ULINTPF ", "
++					"unable to load buffer pool",
++					full_filename,
++					space_id, page_no,
++					i);
++			return;
++		}
++		/*
++		dump[i] = BUF_DUMP_CREATE(space_id, page_no);
++		*/
++		dump[i].space = space_id;
++		dump[i].offset = page_no;
++		dump[i].old = old;
++	}
++
++	/* Set dump_n to the actual number of initialized elements,
++	i could be smaller than dump_n here if the file got truncated after
++	we read it the first time. */
++	dump_n = i;
++
++	fclose(f);
++
++	if (dump_n == 0) {
++		ut_free(dump);
++		ut_sprintf_timestamp(now);
++		buf_load_status(STATUS_NOTICE,
++				"Buffer pool(s) load completed at %s "
++				"(%s was empty)", now, full_filename);
++		return;
++	}
++
++	if (!SHUTTING_DOWN()) {
++		qsort(dump, dump_n, sizeof(buf_dump_t), buf_dump_cmp);
++		/*
++		buf_dump_sort(dump, dump_tmp, 0, dump_n);
++		*/
++	}
++
++
++	for (i = 0; i < dump_n && !SHUTTING_DOWN(); i++) {
++		/*
++		buf_read_page_async(BUF_DUMP_SPACE(dump[i]),
++				    BUF_DUMP_PAGE(dump[i]));
++		*/
++		buf_read_page_async(dump[i].space, dump[i].offset,dump[i].old);
++
++		if (i % 64 == 63) {
++			os_aio_simulated_wake_handler_threads();
++		}
++
++		if (i % 128 == 0) {
++			buf_load_status(STATUS_INFO,
++					"Loaded " ULINTPF "/" ULINTPF " pages",
++					i + 1, dump_n);
++		}
++	}
++
++	ut_free(dump);
++
++	ut_sprintf_timestamp(now);
++
++	buf_load_status(STATUS_NOTICE,
++			"Buffer pool(s) load completed at %s", now);
++}
++/*****************************************************************//**
++This is the main thread for buffer pool dump/load. It waits for an
++event and when waked up either performs a dump or load and sleeps
++again.
++@return this function does not return, it calls os_thread_exit() */
++UNIV_INTERN
++os_thread_ret_t buf_dump_thread(
++/*============================*/
++	void*	arg __attribute__((unused)))	/*!< in: a dummy parameter
++						required by os_thread_create */
++{
++	srv_buf_dump_thread_active = TRUE;
++
++	buf_dump_status(STATUS_INFO, "not started");
++	buf_load_status(STATUS_INFO, "not started");
++
++	if (srv_buffer_pool_load_at_startup) {
++		buf_load();
++	}
++
++	while (!SHUTTING_DOWN()) {
++		os_event_wait_time(srv_buf_dump_event,srv_buffer_pool_dump_interval * 10000000);
++		if(srv_buffer_pool_dump) {
++			if(buf_dump_should_start)
++			{
++				buf_dump_should_start = FALSE;
++				buf_dump(TRUE /* quit on shutdown */);
++			}
++			if(buf_load_should_start)
++			{
++				buf_load_should_start = FALSE;
++				buf_load();
++			}
++		}
++		os_event_reset(srv_buf_dump_event);
++	}
++
++	if (srv_buffer_pool_dump && srv_fast_shutdown != 2) {
++		buf_dump(FALSE /* ignore shutdown down flag,
++		keep going even if we are in a shutdown state */);
++	}
++
++	srv_buf_dump_thread_active = FALSE;
++
++	/* We count the number of threads in os_thread_exit(). A created
++	thread should always use that to exit and not use return() to exit. */
++	os_thread_exit(NULL);
++
++	OS_THREAD_DUMMY_RETURN;
++}
+diff -urNad mysql-5.5.20.raw/storage/innobase/buf/buf0rea.c mysql-5.5.20.new/storage/innobase/buf/buf0rea.c
+--- mysql-5.5.20.raw/storage/innobase/buf/buf0rea.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/buf/buf0rea.c	2012-04-20 15:08:07.000000000 +0800
+@@ -79,16 +79,21 @@
+ 			treat the tablespace as dropped; this is a timestamp we
+ 			use to stop dangling page reads from a tablespace
+ 			which we have DISCARDed + IMPORTed back */
+-	ulint	offset)	/*!< in: page number */
++	ulint	offset,	/*!< in: page number */
++	ibool	old)
+ {
+ 	buf_page_t*	bpage;
+ 	ulint		wake_later;
++	ibool		ignore_nonexistent_pages;
+ 
+ 	*err = DB_SUCCESS;
+ 
+ 	wake_later = mode & OS_AIO_SIMULATED_WAKE_LATER;
+ 	mode = mode & ~OS_AIO_SIMULATED_WAKE_LATER;
+ 
++	ignore_nonexistent_pages = mode & BUF_READ_IGNORE_NONEXISTENT_PAGES;
++	mode &= ~BUF_READ_IGNORE_NONEXISTENT_PAGES;
++
+ 	if (trx_doublewrite && space == TRX_SYS_SPACE
+ 	    && (   (offset >= trx_doublewrite->block1
+ 		    && offset < trx_doublewrite->block1
+@@ -122,7 +127,7 @@
+ 	pool for read, then DISCARD cannot proceed until the read has
+ 	completed */
+ 	bpage = buf_page_init_for_read(err, mode, space, zip_size, unzip,
+-				       tablespace_version, offset);
++				       tablespace_version, offset,old);
+ 	if (bpage == NULL) {
+ 
+ 		return(0);
+@@ -141,7 +146,7 @@
+ 
+ 	thd_wait_begin(NULL, THD_WAIT_DISKIO);
+ 	if (zip_size) {
+-		*err = fil_io(OS_FILE_READ | wake_later,
++		*err = fil_io(OS_FILE_READ | wake_later | ignore_nonexistent_pages,
+ 			      sync, space, zip_size, offset, 0, zip_size,
+ 			      bpage->zip.data, bpage);
+ 	} else {
+@@ -290,7 +295,7 @@
+ 				&err, FALSE,
+ 				ibuf_mode | OS_AIO_SIMULATED_WAKE_LATER,
+ 				space, zip_size, FALSE,
+-				tablespace_version, i);
++				tablespace_version, i,TRUE);
+ 			if (err == DB_TABLESPACE_DELETED) {
+ 				ut_print_timestamp(stderr);
+ 				fprintf(stderr,
+@@ -354,7 +359,7 @@
+ 
+ 	count = buf_read_page_low(&err, TRUE, BUF_READ_ANY_PAGE, space,
+ 				  zip_size, FALSE,
+-				  tablespace_version, offset);
++				  tablespace_version, offset,TRUE);
+ 	srv_buf_pool_reads += count;
+ 	if (err == DB_TABLESPACE_DELETED) {
+ 		ut_print_timestamp(stderr);
+@@ -376,6 +381,50 @@
+ }
+ 
+ /********************************************************************//**
++High-level function which reads a page asynchronously from a file to the
++buffer buf_pool if it is not already there. Sets the io_fix flag and sets
++an exclusive lock on the buffer frame. The flag is cleared and the x-lock
++released by the i/o-handler thread.
++@return TRUE if page has been read in, FALSE in case of failure */
++UNIV_INTERN
++ibool
++buf_read_page_async(
++/*================*/
++	ulint	space,	/*!< in: space id */
++	ulint	offset,
++	ulint	old)	/*!< in: page number */
++{
++	ulint		zip_size;
++	ib_int64_t	tablespace_version;
++	ulint		count;
++	ulint		err;
++
++	zip_size = fil_space_get_zip_size(space);
++
++	if (zip_size == ULINT_UNDEFINED) {
++		return(FALSE);
++	}
++
++	tablespace_version = fil_space_get_version(space);
++
++	count = buf_read_page_low(&err, TRUE, BUF_READ_ANY_PAGE
++				  | OS_AIO_SIMULATED_WAKE_LATER
++				  | BUF_READ_IGNORE_NONEXISTENT_PAGES,
++				  space, zip_size, FALSE,
++				  tablespace_version, offset,old);
++	srv_buf_pool_reads += count;
++
++	/* We do not increment number of I/O operations used for LRU policy
++	here (buf_LRU_stat_inc_io()). We use this in heuristics to decide
++	about evicting uncompressed version of compressed pages from the
++	buffer pool. Since this function is called from buffer pool load
++	these IOs are deliberate and are not part of normal workload we can
++	ignore these in our heuristics. */
++
++	return(count > 0);
++}
++
++/********************************************************************//**
+ Applies linear read-ahead if in the buf_pool the page is a border page of
+ a linear read-ahead area and all the pages in the area have been accessed.
+ Does not read any page if the read-ahead mechanism is not activated. Note
+@@ -616,7 +665,7 @@
+ 			count += buf_read_page_low(
+ 				&err, FALSE,
+ 				ibuf_mode,
+-				space, zip_size, FALSE, tablespace_version, i);
++				space, zip_size, FALSE, tablespace_version, i,TRUE);
+ 			if (err == DB_TABLESPACE_DELETED) {
+ 				ut_print_timestamp(stderr);
+ 				fprintf(stderr,
+@@ -709,7 +758,7 @@
+ 		buf_read_page_low(&err, sync && (i + 1 == n_stored),
+ 				  BUF_READ_ANY_PAGE, space_ids[i],
+ 				  zip_size, TRUE, space_versions[i],
+-				  page_nos[i]);
++				  page_nos[i],TRUE);
+ 
+ 		if (UNIV_UNLIKELY(err == DB_TABLESPACE_DELETED)) {
+ tablespace_deleted:
+@@ -807,12 +856,12 @@
+ 		if ((i + 1 == n_stored) && sync) {
+ 			buf_read_page_low(&err, TRUE, BUF_READ_ANY_PAGE, space,
+ 					  zip_size, TRUE, tablespace_version,
+-					  page_nos[i]);
++					  page_nos[i],TRUE);
+ 		} else {
+ 			buf_read_page_low(&err, FALSE, BUF_READ_ANY_PAGE
+ 					  | OS_AIO_SIMULATED_WAKE_LATER,
+ 					  space, zip_size, TRUE,
+-					  tablespace_version, page_nos[i]);
++					  tablespace_version, page_nos[i],TRUE);
+ 		}
+ 	}
+ 
+diff -urNad mysql-5.5.20.raw/storage/innobase/handler/ha_innodb.cc mysql-5.5.20.new/storage/innobase/handler/ha_innodb.cc
+--- mysql-5.5.20.raw/storage/innobase/handler/ha_innodb.cc	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/handler/ha_innodb.cc	2012-04-20 15:08:25.000000000 +0800
+@@ -58,6 +58,7 @@
+ /* Include necessary InnoDB headers */
+ extern "C" {
+ #include "univ.i"
++#include "buf0dump.h"
+ #include "buf0lru.h"
+ #include "btr0sea.h"
+ #include "os0file.h"
+@@ -156,6 +157,7 @@
+ 
+ static ulong	innobase_fast_shutdown			= 1;
+ static my_bool	innobase_file_format_check		= TRUE;
++static my_bool	innobase_use_shm_preload		= FALSE;
+ #ifdef UNIV_LOG_ARCHIVE
+ static my_bool	innobase_log_archive			= FALSE;
+ static char*	innobase_log_arch_dir			= NULL;
+@@ -598,6 +600,10 @@
+ 	trx_t*	trx);	/*!< in: transaction handle */
+ 
+ static SHOW_VAR innodb_status_variables[]= {
++  {"buffer_pool_dump_status",
++  (char*) &export_vars.innodb_buffer_pool_dump_status,	  SHOW_CHAR},
++  {"buffer_pool_load_status",
++  (char*) &export_vars.innodb_buffer_pool_load_status,	  SHOW_CHAR},
+   {"buffer_pool_pages_data",
+   (char*) &export_vars.innodb_buffer_pool_pages_data,	  SHOW_LONG},
+   {"buffer_pool_pages_dirty",
+@@ -2461,6 +2467,7 @@
+ 	srv_log_buffer_size = (ulint) innobase_log_buffer_size;
+ 
+ 	srv_buf_pool_size = (ulint) innobase_buffer_pool_size;
++	srv_use_shm_preload = (ibool)innobase_use_shm_preload;
+ 	srv_buf_pool_instances = (ulint) innobase_buffer_pool_instances;
+ 
+ 	srv_mem_pool_size = (ulint) innobase_additional_mem_pool_size;
+@@ -11088,6 +11095,52 @@
+ 	return(false);
+ }
+ 
++static my_bool innodb_buffer_pool_dump_now = FALSE;
++static my_bool innodb_buffer_pool_load_now = FALSE;
++
++static
++void
++buffer_pool_dump_now(
++/*=================*/
++	THD*				thd	/*!< in: thread handle */
++					__attribute__((unused)),
++	struct st_mysql_sys_var*	var	/*!< in: pointer to system
++						variable */
++					__attribute__((unused)),
++	void*				var_ptr	/*!< out: where the formal
++						string goes */
++					__attribute__((unused)),
++	const void*			save)	/*!< in: immediate result from
++						check function */
++{
++	if (*(my_bool*) save) {
++		buf_dump_start();
++	}
++}
++
++/****************************************************************//**
++Trigger a load of the buffer pool if innodb_buffer_pool_load_now is set
++to ON. This function is registered as a callback with MySQL. */
++static
++void
++buffer_pool_load_now(
++/*=================*/
++	THD*				thd	/*!< in: thread handle */
++					__attribute__((unused)),
++	struct st_mysql_sys_var*	var	/*!< in: pointer to system
++						variable */
++					__attribute__((unused)),
++	void*				var_ptr	/*!< out: where the formal
++						string goes */
++					__attribute__((unused)),
++	const void*			save)	/*!< in: immediate result from
++						check function */
++{
++	if (*(my_bool*) save) {
++		buf_load_start();
++	}
++}
++
+ static SHOW_VAR innodb_status_variables_export[]= {
+   {"Innodb",                   (char*) &show_innodb_vars, SHOW_FUNC},
+   {NullS, NullS, SHOW_LONG}
+@@ -11171,6 +11224,44 @@
+   "Whether to perform system file format check.",
+   NULL, NULL, TRUE);
+ 
++#ifndef __WIN__
++static MYSQL_SYSVAR_BOOL(use_shm_preload, innobase_use_shm_preload,	
++  PLUGIN_VAR_NOCMDARG,
++  "Whether to use the share memory for data_pool.",	
++  NULL, NULL, FALSE);
++#endif
++
++static MYSQL_SYSVAR_BOOL(buffer_pool_dump, srv_buffer_pool_dump,
++  PLUGIN_VAR_RQCMDARG,
++  "Dump the buffer pool into a file named @@innodb_buffer_pool_filename",
++  NULL, NULL, FALSE);
++
++/* there is no point in changing this during runtime, thus readonly */
++static MYSQL_SYSVAR_BOOL(buffer_pool_load_at_startup, srv_buffer_pool_load_at_startup,
++  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
++  "Load the buffer pool from a file named @@innodb_buffer_pool_filename at startup",
++  NULL, NULL, FALSE);
++
++static MYSQL_SYSVAR_BOOL(buffer_pool_dump_now, innodb_buffer_pool_dump_now,
++  PLUGIN_VAR_RQCMDARG,
++  "Trigger an immediate dump of the buffer pool into a file named @@innodb_buffer_pool_filename",
++  NULL, buffer_pool_dump_now, FALSE);
++
++static MYSQL_SYSVAR_BOOL(buffer_pool_load_now, innodb_buffer_pool_load_now,
++  PLUGIN_VAR_RQCMDARG,
++  "Trigger an immediate load of the buffer pool into a file named @@innodb_buffer_pool_filename",
++  NULL, buffer_pool_load_now, FALSE);
++
++static MYSQL_SYSVAR_STR(buffer_pool_filename, srv_buf_dump_filename,
++  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
++  "Filename to/from which to dump/load the InnoDB buffer pool",
++  NULL, NULL, SRV_BUF_DUMP_FILENAME_DEFAULT);
++
++static MYSQL_SYSVAR_ULONG(buffer_pool_dump_interval, srv_buffer_pool_dump_interval,
++  PLUGIN_VAR_OPCMDARG,
++  "the LRU list dump interval",
++  NULL, NULL, 1800, 1800, ~0UL, 0);
++
+ /* If a new file format is introduced, the file format
+ name needs to be updated accordingly. Please refer to
+ file_format_name_map[] defined in trx0sys.c for the next
+@@ -11456,6 +11547,15 @@
+   MYSQL_SYSVAR(file_per_table),
+   MYSQL_SYSVAR(file_format),
+   MYSQL_SYSVAR(file_format_check),
++#ifndef __WIN__
++  MYSQL_SYSVAR(use_shm_preload),
++#endif
++  MYSQL_SYSVAR(buffer_pool_filename),
++  MYSQL_SYSVAR(buffer_pool_dump_now),
++  MYSQL_SYSVAR(buffer_pool_load_now),
++  MYSQL_SYSVAR(buffer_pool_dump),
++  MYSQL_SYSVAR(buffer_pool_load_at_startup),
++  MYSQL_SYSVAR(buffer_pool_dump_interval),
+   MYSQL_SYSVAR(file_format_max),
+   MYSQL_SYSVAR(flush_log_at_trx_commit),
+   MYSQL_SYSVAR(flush_method),
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/buf0buf.h mysql-5.5.20.new/storage/innobase/include/buf0buf.h
+--- mysql-5.5.20.raw/storage/innobase/include/buf0buf.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/buf0buf.h	2012-04-20 15:08:46.000000000 +0800
+@@ -765,6 +765,10 @@
+ UNIV_INTERN
+ void
+ buf_pool_invalidate(void);
++
++UNIV_INTERN
++void
++buf_pool_init_LRU_block(void);
+ /*=====================*/
+ #endif /* !UNIV_HOTBACKUP */
+ 
+@@ -1123,7 +1127,8 @@
+ 	ib_int64_t	tablespace_version,/*!< in: prevents reading from a wrong
+ 				version of the tablespace in case we have done
+ 				DISCARD + IMPORT */
+-	ulint		offset);/*!< in: page number */
++	ulint		offset,/*!< in: page number */
++	ibool		old);
+ /********************************************************************//**
+ Completes an asynchronous read or write request of a file page to or from
+ the buffer pool. */
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/buf0dump.h mysql-5.5.20.new/storage/innobase/include/buf0dump.h
+--- mysql-5.5.20.raw/storage/innobase/include/buf0dump.h	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/buf0dump.h	2012-03-14 11:06:20.000000000 +0800
+@@ -0,0 +1,79 @@
++/*****************************************************************************
++
++Copyright (c) 2011, 2011, Oracle and/or its affiliates. All Rights Reserved.
++
++This program is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free Software
++Foundation; version 2 of the License.
++
++This program is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License along with
++this program; if not, write to the Free Software Foundation, Inc.,
++51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
++
++*****************************************************************************/
++
++/**************************************************//**
++@file buf/buf0dump.h
++Implements a buffer pool dump/load.
++
++Created April 08, 2011 Vasil Dimov
++*******************************************************/
++
++#ifndef buf0dump_h
++#define buf0dump_h
++
++#include "univ.i"
++
++struct buf_dump_struct
++{
++	unsigned		space:32;
++	unsigned		offset:32;
++	unsigned		old:1;
++};
++
++typedef struct buf_dump_struct	buf_dump_t;
++
++/*****************************************************************//**
++Wakes up the buffer pool dump/load thread and instructs it to start
++a dump. This function is called by MySQL code via buffer_pool_dump_now()
++and it should return immediately because the whole MySQL is frozen during
++its execution. */
++UNIV_INTERN
++void
++buf_dump_start();
++/*============*/
++
++/*****************************************************************//**
++Wakes up the buffer pool dump/load thread and instructs it to start
++a load. This function is called by MySQL code via buffer_pool_load_now()
++and it should return immediately because the whole MySQL is frozen during
++its execution. */
++UNIV_INTERN
++void
++buf_load_start();
++/*============*/
++
++/*****************************************************************//**
++Aborts a currently running buffer pool load. This function is called by
++MySQL code via buffer_pool_load_abort() and it should return immediately
++because the whole MySQL is frozen during its execution. */
++UNIV_INTERN
++void
++buf_load_abort();
++/*============*/
++
++/*****************************************************************//**
++This is the main thread for buffer pool dump/load. It waits for an
++event and when waked up either performs a dump or load and sleeps
++again.
++@return this function does not return, it calls os_thread_exit() */
++UNIV_INTERN
++os_thread_ret_t buf_dump_thread(
++/*============================*/
++	void*	arg);				/*!< in: a dummy parameter
++						required by os_thread_create */
++#endif /* buf0dump_h */
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/buf0rea.h mysql-5.5.20.new/storage/innobase/include/buf0rea.h
+--- mysql-5.5.20.raw/storage/innobase/include/buf0rea.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/buf0rea.h	2012-04-20 15:09:02.000000000 +0800
+@@ -42,6 +42,20 @@
+ 	ulint	space,	/*!< in: space id */
+ 	ulint	zip_size,/*!< in: compressed page size in bytes, or 0 */
+ 	ulint	offset);/*!< in: page number */
++
++/********************************************************************//**
++High-level function which reads a page asynchronously from a file to the
++buffer buf_pool if it is not already there. Sets the io_fix flag and sets
++an exclusive lock on the buffer frame. The flag is cleared and the x-lock
++released by the i/o-handler thread.
++@return TRUE if page has been read in, FALSE in case of failure */
++UNIV_INTERN
++ibool
++buf_read_page_async(
++	/*================*/
++	ulint	space,	/*!< in: space id */
++	ulint	offset,
++	ulint	old);/*!< in: page number */
+ /********************************************************************//**
+ Applies a random read-ahead in buf_pool if there are at least a threshold
+ value of accessed pages from the random read-ahead area. Does not read any
+@@ -158,5 +172,6 @@
+ /** read any page */
+ #define BUF_READ_ANY_PAGE		132
+ /* @} */
++#define BUF_READ_IGNORE_NONEXISTENT_PAGES 1024
+ 
+ #endif
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/log0recv.h mysql-5.5.20.new/storage/innobase/include/log0recv.h
+--- mysql-5.5.20.raw/storage/innobase/include/log0recv.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/log0recv.h	2012-04-20 15:09:18.000000000 +0800
+@@ -208,6 +208,10 @@
+ 					to this lsn */
+ 	ib_uint64_t*	group_scanned_lsn);/*!< out: scanning succeeded up to
+ 					this lsn */
++
++UNIV_INTERN
++ib_uint64_t
++get_srv_start_lsn(void);
+ /******************************************************//**
+ Resets the logs. The contents of log files will be lost! */
+ UNIV_INTERN
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/os0proc.h mysql-5.5.20.new/storage/innobase/include/os0proc.h
+--- mysql-5.5.20.raw/storage/innobase/include/os0proc.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/os0proc.h	2012-04-20 15:09:31.000000000 +0800
+@@ -41,6 +41,8 @@
+ /* Large page size. This may be a boot-time option on some platforms */
+ extern ulint os_large_page_size;
+ 
++extern ibool is_shutdown_normally;
++
+ /****************************************************************//**
+ Converts the current process id to a number. It is not guaranteed that the
+ number is unique. In Linux returns the 'process number' of the current
+@@ -51,6 +53,21 @@
+ ulint
+ os_proc_get_number(void);
+ /*====================*/
++
++/****************************************************************//**
++Allocates large pages memory with shmget
++@return allocated memory*/
++UNIV_INTERN
++void*
++os_mem_alloc_shm(
++	ulint*	n,
++	ibool*	exist);
++/****************************************************************//**
++delete the shm if not use at start*/
++UNIV_INTERN
++void
++del_shm_not_use(void);
++
+ /****************************************************************//**
+ Allocates large pages memory.
+ @return	allocated memory */
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/os0sync.h mysql-5.5.20.new/storage/innobase/include/os0sync.h
+--- mysql-5.5.20.raw/storage/innobase/include/os0sync.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/os0sync.h	2012-04-20 15:09:47.000000000 +0800
+@@ -176,7 +176,7 @@
+ 					os_event_reset(). */
+ 
+ #define os_event_wait(event) os_event_wait_low(event, 0)
+-#define os_event_wait_time(e, t) os_event_wait_time_low(event, t, 0)
++#define os_event_wait_time(event, t) os_event_wait_time_low(event, t, 0)
+ 
+ /**********************************************************//**
+ Waits for an event object until it is in the signaled state or
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/srv0srv.h mysql-5.5.20.new/storage/innobase/include/srv0srv.h
+--- mysql-5.5.20.raw/storage/innobase/include/srv0srv.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/srv0srv.h	2012-04-20 15:10:04.000000000 +0800
+@@ -66,6 +66,14 @@
+ /* The error monitor thread waits on this event. */
+ extern os_event_t	srv_error_event;
+ 
++extern os_event_t	srv_buf_dump_event;
++extern char			srv_buffer_pool_dump;
++extern char			srv_buffer_pool_load_at_startup;
++extern ulong		srv_buffer_pool_dump_interval;
++#define SRV_BUF_DUMP_FILENAME_DEFAULT	"ib_buffer_pool"
++extern char*		srv_buf_dump_filename;
++extern ibool		srv_buf_dump_thread_active;
++
+ /* If the last data file is auto-extended, we add this many pages to it
+ at a time */
+ #define SRV_AUTO_EXTEND_INCREMENT	\
+@@ -154,6 +162,7 @@
+ #else
+ extern ibool	srv_use_sys_malloc;
+ #endif /* UNIV_HOTBACKUP */
++extern ibool	srv_use_shm_preload;
+ extern ulint	srv_buf_pool_size;	/*!< requested size in bytes */
+ extern ulint    srv_buf_pool_instances; /*!< requested number of buffer pool instances */
+ extern ulint	srv_buf_pool_old_size;	/*!< previously requested size */
+@@ -695,6 +704,8 @@
+ 	ulint innodb_data_writes;		/*!< I/O write requests */
+ 	ulint innodb_data_written;		/*!< Data bytes written */
+ 	ulint innodb_data_reads;		/*!< I/O read requests */
++	char  innodb_buffer_pool_dump_status[512];/*!< Buf pool dump status */
++	char  innodb_buffer_pool_load_status[512];/*!< Buf pool load status */
+ 	ulint innodb_buffer_pool_pages_total;	/*!< Buffer pool size */
+ 	ulint innodb_buffer_pool_pages_data;	/*!< Data pages */
+ 	ulint innodb_buffer_pool_pages_dirty;	/*!< Dirty data pages */
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/srv0start.h mysql-5.5.20.new/storage/innobase/include/srv0start.h
+--- mysql-5.5.20.raw/storage/innobase/include/srv0start.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/srv0start.h	2012-04-20 15:10:15.000000000 +0800
+@@ -29,6 +29,11 @@
+ #include "univ.i"
+ #include "ut0byte.h"
+ 
++#ifdef __WIN__
++#define SRV_PATH_SEPARATOR	'\\'
++#else
++#define SRV_PATH_SEPARATOR	'/'
++#endif
+ /*********************************************************************//**
+ Normalizes a directory path for Windows: converts slashes to backslashes. */
+ UNIV_INTERN
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/ut0ut.h mysql-5.5.20.new/storage/innobase/include/ut0ut.h
+--- mysql-5.5.20.raw/storage/innobase/include/ut0ut.h	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/ut0ut.h	2012-04-20 15:10:30.000000000 +0800
+@@ -391,11 +391,29 @@
+ 	size_t		size,	/*!< in: str size */
+ 	const char*	fmt,	/*!< in: format */
+ 	...);			/*!< in: format values */
++
++/**********************************************************************//**
++A substitute for vsnprintf(3), formatted output conversion into
++a limited buffer. Note: this function DOES NOT return the number of
++characters that would have been printed if the buffer was unlimited because
++VC's _vsnprintf() returns -1 in this case and we would need to call
++_vscprintf() in addition to estimate that but we would need another copy
++of "ap" for that and VC does not provide va_copy(). */
++UNIV_INTERN
++void
++ut_vsnprintf(
++	/*=========*/
++	char*		str,	/*!< out: string */
++	size_t		size,	/*!< in: str size */
++	const char*	fmt,	/*!< in: format */
++	va_list		ap);	/*!< in: format values */
+ #else
+ /**********************************************************************//**
+ A wrapper for snprintf(3), formatted output conversion into
+ a limited buffer. */
+ # define ut_snprintf	snprintf
++# define ut_vsnprintf(buf, size, fmt, ap)	\
++	((void) vsnprintf(buf, size, fmt, ap))
+ #endif /* __WIN__ */
+ 
+ /*************************************************************//**
+diff -urNad mysql-5.5.20.raw/storage/innobase/log/log0recv.c mysql-5.5.20.new/storage/innobase/log/log0recv.c
+--- mysql-5.5.20.raw/storage/innobase/log/log0recv.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/log/log0recv.c	2012-04-20 15:10:51.000000000 +0800
+@@ -3334,6 +3334,30 @@
+ }
+ 
+ /******************************************************//**
++get the log sequence number when mysql is startted*/
++UNIV_INTERN
++ib_uint64_t
++get_srv_start_lsn()
++{
++	log_group_t *max_cp_group;
++	ulint		 max_cp_field;
++	ulint		 err;
++	unsigned char *buf;
++	buf = mem_alloc(2 * OS_FILE_LOG_BLOCK_SIZE);
++	mutex_enter(&(log_sys->mutex));
++	err = recv_find_max_checkpoint(&max_cp_group, &max_cp_field);
++	if(err != DB_SUCCESS) {
++		mutex_exit(&(log_sys->mutex));
++		return 0;
++	}
++	fil_io(OS_FILE_READ | OS_FILE_LOG, TRUE, max_cp_group->space_id, 0,
++		max_cp_field / UNIV_PAGE_SIZE, max_cp_field % UNIV_PAGE_SIZE,OS_FILE_LOG_BLOCK_SIZE, buf, NULL);
++	mutex_exit(&(log_sys->mutex));
++	srv_start_lsn = mach_read_from_8(buf + LOG_CHECKPOINT_LSN);
++	return srv_start_lsn;
++}
++
++/******************************************************//**
+ Resets the logs. The contents of log files will be lost! */
+ UNIV_INTERN
+ void
+diff -urNad mysql-5.5.20.raw/storage/innobase/os/os0proc.c mysql-5.5.20.new/storage/innobase/os/os0proc.c
+--- mysql-5.5.20.raw/storage/innobase/os/os0proc.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/os/os0proc.c	2012-04-20 15:11:09.000000000 +0800
+@@ -44,6 +44,8 @@
+ /* Large page size. This may be a boot-time option on some platforms */
+ UNIV_INTERN ulint os_large_page_size;
+ 
++UNIV_INTERN ibool is_shutdown_normally = TRUE;
++
+ /****************************************************************//**
+ Converts the current process id to a number. It is not guaranteed that the
+ number is unique. In Linux returns the 'process number' of the current
+@@ -172,6 +174,144 @@
+ 	}
+ #endif
+ 	return(ptr);
++}
++
++/****************************************************************//**
++delete the shm when the mysqld is stopped if not use*/
++UNIV_INTERN
++void
++del_shm_not_use()
++{
++#ifndef __WIN__
++	int shmid;
++	struct shmid_ds buf;
++	key_t key;
++	static  ulint buf_instance_count;
++
++	buf_instance_count = 1;
++	key = ftok(".",0);
++	if(key != -1)
++	{
++		key += buf_instance_count;
++		shmid = shmget(key,1,SHM_R | SHM_W);
++		if(shmid >= 0)
++		{
++			shmctl(shmid,IPC_RMID,&buf);
++		}
++	}
++#endif
++}
++/****************************************************************//**
++Allocates large pages with shm.
++@return	allocated memory */
++UNIV_INTERN
++void*
++os_mem_alloc_shm(
++/*===============*/
++	ulint*	n,
++	ibool*	exist)			/*!< in/out: number of bytes */
++{
++	void*	ptr;
++	ulint	size;
++#ifdef __WIN__
++	SYSTEM_INFO	system_info;
++	GetSystemInfo(&system_info);
++
++	/* Align block size to system page size */
++	ut_ad(ut_is_2pow(system_info.dwPageSize));
++	/* system_info.dwPageSize is only 32-bit. Casting to ulint is required
++	on 64-bit Windows. */
++	size = *n = ut_2pow_round(*n + (system_info.dwPageSize - 1),(ulint) system_info.dwPageSize);
++	ptr = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE,PAGE_READWRITE);
++	if (!ptr) 
++	{
++		fprintf(stderr, "InnoDB: VirtualAlloc(%lu bytes) failed; Windows error %lu\n",
++			(ulong) size, (ulong) GetLastError());
++	} 
++	else 
++	{
++		os_fast_mutex_lock(&ut_list_mutex);
++		ut_total_allocated_memory += size;
++		os_fast_mutex_unlock(&ut_list_mutex);
++		UNIV_MEM_ALLOC(ptr, size);
++		return(ptr);
++	}
++#else	
++	int 	shmid;
++	struct shmid_ds buf;
++	key_t 	key;
++	static 	ulint buf_instance_count;	
++
++	buf_instance_count = 1;
++	os_large_page_size = 16384;
++
++
++	/* Align block size to os_large_page_size */
++	ut_ad(ut_is_2pow(os_large_page_size));
++	size = ut_2pow_round(*n + (os_large_page_size - 1),os_large_page_size);
++	key = ftok(".",0);
++	if(key == -1)
++	{
++		fprintf(stderr, "InnoDB alloc shm: Warning: error key for shmget\n");
++		ptr = NULL;
++	}
++	else
++	{
++		key += buf_instance_count;
++		shmid = shmget(key, 0, SHM_R | SHM_W);
++		if(shmid < 0)
++		{
++			shmid = shmget(key, (size_t)size, IPC_CREAT | SHM_R | SHM_W);
++		}
++		else
++		{
++			shmctl(shmid,IPC_STAT,&buf);
++			if(buf.shm_segsz != size /*|| !is_shutdown_normally*/)
++			{
++				ut_print_timestamp(stderr);
++				fprintf(stderr," InnoDB: WARNING: buf pool is invalid because of the size changed\n" /*or shutdown not normally\n"*/);
++				shmctl(shmid,IPC_RMID,&buf);
++				shmid = shmget(key, (size_t)size, IPC_CREAT | SHM_R | SHM_W);
++			}
++			else
++			{
++				*exist = TRUE;
++			}
++		}
++
++		if(shmid < 0) 
++		{
++			fprintf(stderr, "InnoDB: Warning: Failed to allocate"
++				" %lu bytes. errno %d\n", size, errno);
++			ptr = NULL;
++		} 
++		else 
++		{
++			ptr = shmat(shmid, (void*)(0x7fc4f5a4c000 + (buf_instance_count - 1) * size), 0);
++			if (ptr == (void *)-1) 
++			{
++				fprintf(stderr, "InnoDB: HugeTLB: Warning: Failed to"
++					" attach shared memory segment, errno %d\n",errno);
++				ptr = NULL;
++			}
++		}
++	}
++	buf_instance_count++;
++
++	if (ptr) 
++	{
++		*n = size;
++		os_fast_mutex_lock(&ut_list_mutex);
++		ut_total_allocated_memory += size;
++		os_fast_mutex_unlock(&ut_list_mutex);
++# ifdef UNIV_SET_MEM_TO_ZERO
++		memset(ptr, '\0', size);
++# endif
++		UNIV_MEM_ALLOC(ptr, size);
++		return(ptr);
++	}
++#endif
++	return(ptr);
+ }
+ 
+ /****************************************************************//**
+diff -urNad mysql-5.5.20.raw/storage/innobase/srv/srv0srv.c mysql-5.5.20.new/storage/innobase/srv/srv0srv.c
+--- mysql-5.5.20.raw/storage/innobase/srv/srv0srv.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/srv/srv0srv.c	2012-04-20 15:11:25.000000000 +0800
+@@ -204,6 +204,8 @@
+ 
+ /* use os/external memory allocator */
+ UNIV_INTERN my_bool	srv_use_sys_malloc	= TRUE;
++/* use shm allocator */
++UNIV_INTERN ibool	srv_use_shm_preload = FALSE;
+ /* requested size in kilobytes */
+ UNIV_INTERN ulint	srv_buf_pool_size	= ULINT_MAX;
+ /* requested number of buffer pool instances */
+@@ -704,6 +706,14 @@
+ 
+ UNIV_INTERN os_event_t	srv_error_event;
+ 
++/* add for lru dump */
++UNIV_INTERN os_event_t	srv_buf_dump_event;
++UNIV_INTERN char *		srv_buf_dump_filename;
++UNIV_INTERN char		srv_buffer_pool_dump = FALSE;
++UNIV_INTERN	char		srv_buffer_pool_load_at_startup = FALSE;
++UNIV_INTERN ulong		srv_buffer_pool_dump_interval = 1800;
++UNIV_INTERN ibool		srv_buf_dump_thread_active = FALSE;
++
+ UNIV_INTERN os_event_t	srv_lock_timeout_thread_event;
+ 
+ UNIV_INTERN srv_sys_t*	srv_sys	= NULL;
+@@ -1042,6 +1052,8 @@
+ 
+ 	srv_monitor_event = os_event_create(NULL);
+ 
++	srv_buf_dump_event = os_event_create("buf_dump_event");
++
+ 	srv_lock_timeout_thread_event = os_event_create(NULL);
+ 
+ 	for (i = 0; i < SRV_MASTER + 1; i++) {
+@@ -1101,6 +1113,9 @@
+ 	mem_free(srv_mysql_table);
+ 	srv_mysql_table = NULL;
+ 
++	os_event_free(srv_buf_dump_event);
++	srv_buf_dump_event = NULL;
++
+ 	trx_i_s_cache_free(trx_i_s_cache);
+ }
+ 
+diff -urNad mysql-5.5.20.raw/storage/innobase/srv/srv0start.c mysql-5.5.20.new/storage/innobase/srv/srv0start.c
+--- mysql-5.5.20.raw/storage/innobase/srv/srv0start.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/srv/srv0start.c	2012-04-20 15:11:36.000000000 +0800
+@@ -44,6 +44,7 @@
+ #include "data0type.h"
+ #include "dict0dict.h"
+ #include "buf0buf.h"
++#include "buf0dump.h"
+ #include "os0file.h"
+ #include "os0thread.h"
+ #include "fil0fil.h"
+@@ -1386,48 +1387,11 @@
+ 			((double) srv_buf_pool_size) / (1024 * 1024));
+ 	}
+ 
+-	err = buf_pool_init(srv_buf_pool_size, srv_buf_pool_instances);
+-
+-	ut_print_timestamp(stderr);
+-	fprintf(stderr,
+-		" InnoDB: Completed initialization of buffer pool\n");
+-
+-	if (err != DB_SUCCESS) {
+-		ut_print_timestamp(stderr);
+-		fprintf(stderr,
+-			" InnoDB: Fatal error: cannot allocate memory"
+-			" for the buffer pool\n");
+-
+-		return(DB_ERROR);
+-	}
+-
+-#ifdef UNIV_DEBUG
+-	/* We have observed deadlocks with a 5MB buffer pool but
+-	the actual lower limit could very well be a little higher. */
+-
+-	if (srv_buf_pool_size <= 5 * 1024 * 1024) {
+-
+-		ut_print_timestamp(stderr);
+-		fprintf(stderr, " InnoDB: Warning: Small buffer pool size "
+-			"(%luM), the flst_validate() debug function "
+-			"can cause a deadlock if the buffer pool fills up.\n",
+-			srv_buf_pool_size / 1024 / 1024);
+-	}
+-#endif
+-
+ 	fsp_init();
+ 	log_init();
+ 
+ 	lock_sys_create(srv_lock_table_size);
+ 
+-	/* Create i/o-handler threads: */
+-
+-	for (i = 0; i < srv_n_file_io_threads; i++) {
+-		n[i] = i;
+-
+-		os_thread_create(io_handler_thread, n + i, thread_ids + i);
+-	}
+-
+ #ifdef UNIV_LOG_ARCHIVE
+ 	if (0 != ut_strcmp(srv_log_group_home_dirs[0], srv_arch_dir)) {
+ 		ut_print_timestamp(stderr);
+@@ -1563,6 +1527,45 @@
+ 		}
+ 	}
+ 
++	get_srv_start_lsn();
++	if(srv_start_lsn != min_flushed_lsn || srv_start_lsn != max_flushed_lsn)
++	{
++		is_shutdown_normally = FALSE;
++	}
++	err = buf_pool_init(srv_buf_pool_size, srv_buf_pool_instances);
++	
++	ut_print_timestamp(stderr);
++	fprintf(stderr,
++		" InnoDB: Completed initialization of buffer pool\n");
++
++	if (err != DB_SUCCESS) {
++		ut_print_timestamp(stderr);
++		fprintf(stderr,
++			" InnoDB: Fatal error: cannot allocate memory"
++			" for the buffer pool\n");
++
++		return(DB_ERROR);
++	}
++
++#ifdef UNIV_DEBUG
++	/* We have observed deadlocks with a 5MB buffer pool but
++	the actual lower limit could very well be a little higher. */
++
++	if (srv_buf_pool_size <= 5 * 1024 * 1024) {
++
++		ut_print_timestamp(stderr);
++		fprintf(stderr, " InnoDB: Warning: Small buffer pool size "
++			"(%luM), the flst_validate() debug function "
++			"can cause a deadlock if the buffer pool fills up.\n",
++			srv_buf_pool_size / 1024 / 1024);
++	}
++#endif
++	
++	for (i = 0; i < srv_n_file_io_threads; i++) {
++		n[i] = i;
++
++		os_thread_create(io_handler_thread, n + i, thread_ids + i);
++	}
+ 	/* Open all log files and data files in the system tablespace: we
+ 	keep them open until database shutdown */
+ 
+@@ -1705,6 +1708,7 @@
+ 		and there must be no page in the buf_flush list. */
+ 		buf_pool_invalidate();
+ 
++		buf_pool_init_LRU_block();
+ 		/* We always try to do a recovery, even if the database had
+ 		been shut down normally: this is the normal startup path */
+ 
+@@ -2084,6 +2088,9 @@
+ 		ibuf_update_max_tablespace_id();
+ 	}
+ 
++	/*Create the buffer pool dump/load thread */
++	os_thread_create(&buf_dump_thread, NULL, NULL);
++
+ 	srv_file_per_table = srv_file_per_table_original_value;
+ 
+ 	srv_was_started = TRUE;
+@@ -2142,6 +2149,7 @@
+ 		/* a. Let the lock timeout thread exit */
+ 		os_event_set(srv_lock_timeout_thread_event);
+ 
++		os_event_set(srv_buf_dump_event);
+ 		/* b. srv error monitor thread exits automatically, no need
+ 		to do anything here */
+ 
+diff -urNad mysql-5.5.20.raw/storage/innobase/ut/ut0ut.c mysql-5.5.20.new/storage/innobase/ut/ut0ut.c
+--- mysql-5.5.20.raw/storage/innobase/ut/ut0ut.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/ut/ut0ut.c	2012-04-20 15:11:52.000000000 +0800
+@@ -579,6 +579,26 @@
+ #ifdef __WIN__
+ # include <stdarg.h>
+ /**********************************************************************//**
++A substitute for vsnprintf(3), formatted output conversion into
++a limited buffer. Note: this function DOES NOT return the number of
++characters that would have been printed if the buffer was unlimited because
++VC's _vsnprintf() returns -1 in this case and we would need to call
++_vscprintf() in addition to estimate that but we would need another copy
++of "ap" for that and VC does not provide va_copy(). */
++UNIV_INTERN
++void
++ut_vsnprintf(
++	/*=========*/
++	char*		str,	/*!< out: string */
++	size_t		size,	/*!< in: str size */
++	const char*	fmt,	/*!< in: format */
++	va_list		ap)	/*!< in: format values */
++{
++	_vsnprintf(str, size, fmt, ap);
++	str[size - 1] = '\0';
++}
++
++/**********************************************************************//**
+ A substitute for snprintf(3), formatted output conversion into
+ a limited buffer.
+ @return number of characters that would have been printed if the size

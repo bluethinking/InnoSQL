@@ -1,0 +1,739 @@
+diff -urNad mysql-5.5.20.raw/libmysqld/CMakeLists.txt mysql-5.5.20.new/libmysqld/CMakeLists.txt
+--- mysql-5.5.20.raw/libmysqld/CMakeLists.txt	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/libmysqld/CMakeLists.txt	2012-08-20 17:51:21.000000000 +0800
+@@ -85,6 +85,7 @@
+            ../sql/event_parse_data.cc
+            ../sql/sql_signal.cc ../sql/rpl_handler.cc
+ 	       ../sql/rpl_utility.cc
++           ../sql/sql_iostat.cc
+            ../sql/sys_vars.cc
+            ${CMAKE_BINARY_DIR}/sql/sql_builtin.cc
+            ../sql/mdl.cc ../sql/transaction.cc
+diff -urNad mysql-5.5.20.raw/scripts/mysql_system_tables.sql mysql-5.5.20.new/scripts/mysql_system_tables.sql
+--- mysql-5.5.20.raw/scripts/mysql_system_tables.sql	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/scripts/mysql_system_tables.sql	2012-08-20 17:51:21.000000000 +0800
+@@ -89,7 +89,7 @@
+ 
+ -- Create slow_log if CSV is enabled.
+ 
+-SET @str = IF (@@have_csv = 'YES', 'CREATE TABLE IF NOT EXISTS slow_log (start_time TIMESTAMP NOT NULL, user_host MEDIUMTEXT NOT NULL, query_time TIME NOT NULL, lock_time TIME NOT NULL, rows_sent INTEGER NOT NULL, rows_examined INTEGER NOT NULL, db VARCHAR(512) NOT NULL, last_insert_id INTEGER NOT NULL, insert_id INTEGER NOT NULL, server_id INTEGER UNSIGNED NOT NULL, sql_text MEDIUMTEXT NOT NULL) engine=CSV CHARACTER SET utf8 comment="Slow log"', 'SET @dummy = 0');
++SET @str = IF (@@have_csv = 'YES', 'CREATE TABLE IF NOT EXISTS slow_log (start_time TIMESTAMP NOT NULL, user_host MEDIUMTEXT NOT NULL, query_time TIME NOT NULL, lock_time TIME NOT NULL, rows_sent INTEGER NOT NULL, rows_examined INTEGER NOT NULL, logical_reads INTEGER NOT NULL, physical_reads INTEGER NOT NULL, db VARCHAR(512) NOT NULL, last_insert_id INTEGER NOT NULL, insert_id INTEGER NOT NULL, server_id INTEGER UNSIGNED NOT NULL, sql_text MEDIUMTEXT NOT NULL) engine=CSV CHARACTER SET utf8 comment="Slow log"', 'SET @dummy = 0');
+ 
+ PREPARE stmt FROM @str;
+ EXECUTE stmt;
+diff -urNad mysql-5.5.20.raw/scripts/mysql_system_tables_fix.sql mysql-5.5.20.new/scripts/mysql_system_tables_fix.sql
+--- mysql-5.5.20.raw/scripts/mysql_system_tables_fix.sql	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/scripts/mysql_system_tables_fix.sql	2012-08-20 17:51:21.000000000 +0800
+@@ -250,6 +250,8 @@
+   MODIFY lock_time TIME NOT NULL,
+   MODIFY rows_sent INTEGER NOT NULL,
+   MODIFY rows_examined INTEGER NOT NULL,
++  MODIFY logical_reads INTEGER NOT NULL,
++  MODIFY physical_reads INTEGER NOT NULL,
+   MODIFY db VARCHAR(512) NOT NULL,
+   MODIFY last_insert_id INTEGER NOT NULL,
+   MODIFY insert_id INTEGER NOT NULL,
+diff -urNad mysql-5.5.20.raw/sql/CMakeLists.txt mysql-5.5.20.new/sql/CMakeLists.txt
+--- mysql-5.5.20.raw/sql/CMakeLists.txt	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/CMakeLists.txt	2012-08-20 17:51:21.000000000 +0800
+@@ -75,6 +75,7 @@
+                sql_connect.cc scheduler.cc sql_partition_admin.cc
+                sql_profile.cc event_parse_data.cc sql_alter.cc
+                sql_signal.cc rpl_handler.cc mdl.cc sql_admin.cc
++               sql_iostat.cc
+                transaction.cc sys_vars.cc sql_truncate.cc datadict.cc
+                sql_reload.cc
+                ${GEN_SOURCES}
+@@ -95,9 +96,9 @@
+ # On Windows platform we compile in the clinet-side Windows Native Authentication
+ # plugin which is used by the client connection code included in the server.
+ #
+-IF(WIN32)
+-  ADD_DEFINITIONS(-DAUTHENTICATION_WIN)
+-  TARGET_LINK_LIBRARIES(sql auth_win_client)
++IF(WIN32)
++  ADD_DEFINITIONS(-DAUTHENTICATION_WIN)
++  TARGET_LINK_LIBRARIES(sql auth_win_client)
+ ENDIF() 
+ 
+ IF(WIN32)
+diff -urNad mysql-5.5.20.raw/sql/handler.cc mysql-5.5.20.new/sql/handler.cc
+--- mysql-5.5.20.raw/sql/handler.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/handler.cc	2012-08-20 17:51:21.000000000 +0800
+@@ -40,6 +40,7 @@
+ #include <errno.h>
+ #include "probes_mysql.h"
+ #include "debug_sync.h"         // DEBUG_SYNC
++#include "sql_iostat.h"
+ 
+ #ifdef WITH_PARTITION_STORAGE_ENGINE
+ #include "ha_partition.h"
+@@ -459,6 +460,7 @@
+   }
+ 
+   hton->slot= HA_SLOT_UNDEF;
++  hton->io_stat_ptr = thd_io_incr;
+   /* Historical Requirement */
+   plugin->data= hton; // shortcut for the future
+   if (plugin->plugin->init && plugin->plugin->init(hton))
+diff -urNad mysql-5.5.20.raw/sql/handler.h mysql-5.5.20.new/sql/handler.h
+--- mysql-5.5.20.raw/sql/handler.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/handler.h	2012-08-20 17:51:21.000000000 +0800
+@@ -800,6 +800,7 @@
+                      const char *wild, bool dir, List<LEX_STRING> *files);
+    int (*table_exists_in_engine)(handlerton *hton, THD* thd, const char *db,
+                                  const char *name);
++   void (*io_stat_ptr)(uint stat_type);
+    uint32 license; /* Flag for Engine License */
+    void *data; /* Location for engines to keep personal structures */
+ };
+diff -urNad mysql-5.5.20.raw/sql/log.cc mysql-5.5.20.new/sql/log.cc
+--- mysql-5.5.20.raw/sql/log.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/log.cc	2012-08-20 17:52:28.000000000 +0800
+@@ -461,7 +461,7 @@
+ {
+   switch (log_table_type) {
+   case QUERY_LOG_SLOW:
+-    return (table_log_handler != NULL) && opt_slow_log;
++    return (table_log_handler != NULL) && (opt_slow_log | opt_slow_io_log);
+   case QUERY_LOG_GENERAL:
+     return (table_log_handler != NULL) && opt_log ;
+   default:
+@@ -796,6 +796,12 @@
+     /* rows_examined */
+     if (table->field[5]->store((longlong) thd->examined_row_count, TRUE))
+       goto err;
++	/* logical_reads */
++	if (table->field[6]->store((longlong) thd->logical_reads, TRUE))
++		goto err;
++	/* physical_reads */
++	if (table->field[7]->store((longlong) thd->physical_reads, TRUE))
++		goto err;
+   }
+   else
+   {
+@@ -803,23 +809,25 @@
+     table->field[3]->set_null();
+     table->field[4]->set_null();
+     table->field[5]->set_null();
++    table->field[6]->set_null();
++    table->field[7]->set_null();
+   }
+   /* fill database field */
+   if (thd->db)
+   {
+-    if (table->field[6]->store(thd->db, thd->db_length, client_cs))
++    if (table->field[8]->store(thd->db, thd->db_length, client_cs))
+       goto err;
+-    table->field[6]->set_notnull();
++    table->field[8]->set_notnull();
+   }
+ 
+   if (thd->stmt_depends_on_first_successful_insert_id_in_prev_stmt)
+   {
+     if (table->
+-        field[7]->store((longlong)
++        field[9]->store((longlong)
+                         thd->first_successful_insert_id_in_prev_stmt_for_binlog,
+                         TRUE))
+       goto err;
+-    table->field[7]->set_notnull();
++    table->field[9]->set_notnull();
+   }
+ 
+   /*
+@@ -831,22 +839,22 @@
+   if (thd->auto_inc_intervals_in_cur_stmt_for_binlog.nb_elements() > 0)
+   {
+     if (table->
+-        field[8]->store((longlong)
++        field[10]->store((longlong)
+           thd->auto_inc_intervals_in_cur_stmt_for_binlog.minimum(), TRUE))
+       goto err;
+-    table->field[8]->set_notnull();
++    table->field[10]->set_notnull();
+   }
+ 
+-  if (table->field[9]->store((longlong) server_id, TRUE))
++  if (table->field[11]->store((longlong) server_id, TRUE))
+     goto err;
+-  table->field[9]->set_notnull();
++  table->field[11]->set_notnull();
+ 
+   /*
+     Column sql_text.
+     A positive return value in store() means truncation.
+     Still logging a message in the log in this case.
+   */
+-  if (table->field[10]->store(sql_text, sql_text_len, client_cs) < 0)
++  if (table->field[12]->store(sql_text, sql_text_len, client_cs) < 0)
+     goto err;
+ 
+   /* log table entries are not replicated */
+@@ -977,7 +985,7 @@
+ {
+   if (!is_initialized)
+   {
+-    if (opt_slow_log)
++    if (opt_slow_log || opt_slow_io_log)
+       mysql_slow_log.open_slow_log(opt_slow_logname);
+ 
+     if (opt_log)
+@@ -1001,7 +1009,7 @@
+   /* reopen log files */
+   if (opt_log)
+     mysql_log.reopen_file();
+-  if (opt_slow_log)
++  if (opt_slow_log || opt_slow_io_log)
+     mysql_slow_log.reopen_file();
+ }
+ 
+@@ -1131,7 +1139,7 @@
+   logger.lock_exclusive();
+ 
+   /* Reopen slow log file */
+-  if (opt_slow_log)
++  if (opt_slow_log || opt_slow_io_log)
+     file_log_handler->get_mysql_slow_log()->reopen_file();
+ 
+   /* End of log flush */
+@@ -1207,7 +1215,7 @@
+       return 0;
+ 
+     lock_shared();
+-    if (!opt_slow_log)
++    if (!opt_slow_log && !opt_slow_io_log)
+     {
+       unlock();
+       return 0;
+@@ -1387,7 +1395,7 @@
+   lock_exclusive();
+   switch (log_type) {
+   case QUERY_LOG_SLOW:
+-    if (!opt_slow_log)
++    if (!opt_slow_log || !opt_slow_io_log)
+     {
+       file_log= file_log_handler->get_mysql_slow_log();
+ 
+@@ -1401,7 +1409,8 @@
+       else
+       {
+         init_slow_log(log_output_options);
+-        opt_slow_log= TRUE;
++	opt_slow_log = slow_query_type & 0x0001; 
++	opt_slow_io_log = (slow_query_type & 0x0002) >> 1;
+       }
+     }
+     break;
+@@ -1434,16 +1443,18 @@
+ 
+ void LOGGER::deactivate_log_handler(THD *thd, uint log_type)
+ {
+-  my_bool *tmp_opt= 0;
++  my_bool *tmp_opt= 0, *tmp_opt_io = 0;
+   MYSQL_LOG *file_log;
+ 
+   switch (log_type) {
+   case QUERY_LOG_SLOW:
+     tmp_opt= &opt_slow_log;
++    tmp_opt_io = &opt_slow_io_log;
+     file_log= file_log_handler->get_mysql_slow_log();
+     break;
+   case QUERY_LOG_GENERAL:
+     tmp_opt= &opt_log;
++    tmp_opt_io = &opt_slow_io_log;
+     file_log= file_log_handler->get_mysql_log();
+     break;
+   default:
+@@ -1456,6 +1467,7 @@
+   lock_exclusive();
+   file_log->close(0);
+   *tmp_opt= FALSE;
++  *tmp_opt_io = FALSE;
+   unlock();
+ }
+ 
+@@ -2680,6 +2692,7 @@
+     char query_time_buff[22+7], lock_time_buff[22+7];
+     uint buff_len;
+     end= buff;
++	ulong logical_reads = 0, physical_reads = 0;
+ 
+     if (!(specialflag & SPECIAL_SHORT_LOG_FORMAT))
+     {
+@@ -2707,15 +2720,30 @@
+       if (my_b_write(&log_file, (uchar*) "\n", 1))
+         tmp_errno= errno;
+     }
++
++	if(opt_slow_io_log)
++	{
++		logical_reads = thd->logical_reads;
++		physical_reads = thd->physical_reads;
++	}
+     /* For slow query log */
+-    sprintf(query_time_buff, "%.6f", ulonglong2double(query_utime)/1000000.0);
++	if(opt_slow_log)
++	{
++		sprintf(query_time_buff, "%.6f", ulonglong2double(query_utime)/1000000.0);
++	}
++	else
++	{
++		sprintf(query_time_buff, "%d", 0);
++	}
+     sprintf(lock_time_buff,  "%.6f", ulonglong2double(lock_utime)/1000000.0);
+     if (my_b_printf(&log_file,
+                     "# Query_time: %s  Lock_time: %s"
+-                    " Rows_sent: %lu  Rows_examined: %lu\n",
++                    " Rows_sent: %lu  Rows_examined: %lu"
++		   " Logical_reads: %lu Physical_reads: %lu\n",
+                     query_time_buff, lock_time_buff,
+                     (ulong) thd->sent_row_count,
+-                    (ulong) thd->examined_row_count) == (uint) -1)
++                    (ulong) thd->examined_row_count,
++		    logical_reads, physical_reads) == (uint) -1)
+       tmp_errno= errno;
+     if (thd->db && strcmp(thd->db, db))
+     {						// Database changed
+diff -urNad mysql-5.5.20.raw/sql/mysqld.cc mysql-5.5.20.new/sql/mysqld.cc
+--- mysql-5.5.20.raw/sql/mysqld.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/mysqld.cc	2012-08-20 17:51:21.000000000 +0800
+@@ -91,6 +91,7 @@
+ #include "sp_rcontext.h"
+ #include "sp_cache.h"
+ #include "sql_reload.h"  // reload_acl_and_cache
++#include "sql_iostat.h"
+ 
+ #ifdef HAVE_POLL_H
+ #include <poll.h>
+@@ -353,6 +354,8 @@
+ static mysql_cond_t COND_thread_cache, COND_flush_thread_cache;
+ 
+ /* Global variables */
++ulong slow_query_type;
++my_bool opt_slow_io_log;
+ 
+ bool opt_bin_log, opt_ignore_builtin_innodb= 0;
+ my_bool opt_log, opt_slow_log;
+@@ -2617,7 +2620,7 @@
+       sql_print_information("Got signal %d to shutdown mysqld",sig);
+ #endif
+       /* switch to the old log message processing */
+-      logger.set_handlers(LOG_FILE, opt_slow_log ? LOG_FILE:LOG_NONE,
++      logger.set_handlers(LOG_FILE, (opt_slow_log || opt_slow_io_log) ? LOG_FILE:LOG_NONE,
+                           opt_log ? LOG_FILE:LOG_NONE);
+       DBUG_PRINT("info",("Got signal: %d  abort_loop: %d",sig,abort_loop));
+       if (!abort_loop)
+@@ -2654,13 +2657,13 @@
+       if (log_output_options & LOG_NONE)
+       {
+         logger.set_handlers(LOG_FILE,
+-                            opt_slow_log ? LOG_TABLE : LOG_NONE,
++                            (opt_slow_log || opt_slow_io_log) ? LOG_TABLE : LOG_NONE,
+                             opt_log ? LOG_TABLE : LOG_NONE);
+       }
+       else
+       {
+         logger.set_handlers(LOG_FILE,
+-                            opt_slow_log ? log_output_options : LOG_NONE,
++                            (opt_slow_log || opt_slow_io_log) ? log_output_options : LOG_NONE,
+                             opt_log ? log_output_options : LOG_NONE);
+       }
+       break;
+@@ -3125,6 +3128,11 @@
+     return 1;
+   set_server_version();
+ 
++  opt_slow_log |= (slow_query_type & 0x0001);
++  opt_slow_io_log = (slow_query_type & 0x0002) >> 1;
++  slow_query_type |= opt_slow_log;
++  set_io_stat_flag(&opt_slow_io_log);
++
+ #ifndef EMBEDDED_LIBRARY
+   if (opt_help && !opt_verbose)
+     unireg_abort(0);
+@@ -3891,11 +3899,11 @@
+       /* purecov: end */
+     }
+ 
+-    logger.set_handlers(LOG_FILE, opt_slow_log ? log_output_options:LOG_NONE,
++    logger.set_handlers(LOG_FILE, (opt_slow_log || opt_slow_io_log) ? log_output_options:LOG_NONE,
+                         opt_log ? log_output_options:LOG_NONE);
+   }
+ #else
+-  logger.set_handlers(LOG_FILE, opt_slow_log ? LOG_FILE:LOG_NONE,
++  logger.set_handlers(LOG_FILE, (opt_slow_log || opt_slow_io_log) ? LOG_FILE:LOG_NONE,
+                       opt_log ? LOG_FILE:LOG_NONE);
+ #endif
+ 
+@@ -4121,7 +4129,6 @@
+   DBUG_VOID_RETURN;
+ }
+ #endif//DBUG_OFF
+-
+ #ifdef __WIN__
+ int win_main(int argc, char **argv)
+ #else
+diff -urNad mysql-5.5.20.raw/sql/mysqld.h mysql-5.5.20.new/sql/mysqld.h
+--- mysql-5.5.20.raw/sql/mysqld.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/mysqld.h	2012-08-20 17:51:21.000000000 +0800
+@@ -88,7 +88,7 @@
+ extern MY_BITMAP temp_pool;
+ extern bool opt_large_files, server_id_supplied;
+ extern bool opt_update_log, opt_bin_log, opt_error_log;
+-extern my_bool opt_log, opt_slow_log;
++extern my_bool opt_log, opt_slow_log,opt_slow_io_log;
+ extern my_bool opt_backup_history_log;
+ extern my_bool opt_backup_progress_log;
+ extern ulonglong log_output_options;
+@@ -123,6 +123,7 @@
+ extern char *default_tz_name;
+ extern Time_zone *default_tz;
+ extern char *default_storage_engine;
++extern ulong slow_query_type;
+ extern bool opt_endinfo, using_udf_functions;
+ extern my_bool locked_in_memory;
+ extern bool opt_using_transactions;
+diff -urNad mysql-5.5.20.raw/sql/sql_class.h mysql-5.5.20.new/sql/sql_class.h
+--- mysql-5.5.20.raw/sql/sql_class.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_class.h	2012-08-20 17:51:21.000000000 +0800
+@@ -506,6 +506,8 @@
+ 
+   double long_query_time_double;
+ 
++  ulong	 long_query_io_ulong;
++
+ } SV;
+ 
+ 
+@@ -1958,6 +1960,9 @@
+   */
+   ha_rows    examined_row_count;
+ 
++  ulong	 logical_reads;
++  ulong	 physical_reads;
++
+   USER_CONN *user_connect;
+   CHARSET_INFO *db_charset;
+   Warning_info *warning_info;
+@@ -2294,7 +2299,8 @@
+   void update_server_status()
+   {
+     ulonglong end_utime_of_query= current_utime();
+-    if (end_utime_of_query > utime_after_lock + variables.long_query_time)
++    if ((opt_slow_log && (end_utime_of_query > utime_after_lock + variables.long_query_time)) ||
++		(opt_slow_io_log && (logical_reads > variables.long_query_io_ulong)))
+       server_status|= SERVER_QUERY_WAS_SLOW;
+   }
+   inline ulonglong found_rows(void)
+diff -urNad mysql-5.5.20.raw/sql/sql_iostat.cc mysql-5.5.20.new/sql/sql_iostat.cc
+--- mysql-5.5.20.raw/sql/sql_iostat.cc	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_iostat.cc	2012-08-20 17:51:21.000000000 +0800
+@@ -0,0 +1,23 @@
++#include "sql_iostat.h"
++#include "sql_class.h"
++
++const static my_bool *is_io_stat_used = NULL;
++  
++void thd_io_incr(uint stat_type)
++{
++	THD *thd = current_thd;
++	if(thd == NULL 
++	 || (((thd->variables.option_bits & OPTION_PROFILING) == 0)
++	 && (is_io_stat_used == NULL || !(*is_io_stat_used)))) return;
++	switch(stat_type)
++	{
++		case LOG_READ:thd->logical_reads++;break;
++		case PHY_READ:thd->physical_reads++;break;
++		default:break;
++	}
++}
++
++void set_io_stat_flag(const my_bool *flag)
++{
++	is_io_stat_used = flag;
++}
+diff -urNad mysql-5.5.20.raw/sql/sql_iostat.h mysql-5.5.20.new/sql/sql_iostat.h
+--- mysql-5.5.20.raw/sql/sql_iostat.h	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_iostat.h	2012-08-20 17:51:21.000000000 +0800
+@@ -0,0 +1,22 @@
++#ifndef SQL_IOSTAT_INCLUDED
++#define SQL_IOSTAT_INCLUDED
++
++#include "my_global.h"
++#include "my_sys.h"
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++enum
++{
++	LOG_READ		= 0,
++	PHY_READ
++};
++
++extern void	thd_io_incr(uint stat_type);
++extern void set_io_stat_flag(const my_bool *flag);
++
++#ifdef __cplusplus
++}
++#endif
++#endif /*SQL_IOSTAT_INCLUDED*/
+diff -urNad mysql-5.5.20.raw/sql/sql_parse.cc mysql-5.5.20.new/sql/sql_parse.cc
+--- mysql-5.5.20.raw/sql/sql_parse.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_parse.cc	2012-08-20 17:51:21.000000000 +0800
+@@ -1424,6 +1424,8 @@
+ #if defined(ENABLED_PROFILING)
+   thd->profiling.finish_current_query();
+ #endif
++  thd->logical_reads = thd->physical_reads = 0;
++
+   if (MYSQL_QUERY_DONE_ENABLED() || MYSQL_COMMAND_DONE_ENABLED())
+   {
+     int res __attribute__((unused));
+@@ -5361,6 +5363,7 @@
+   thd->warning_info->reset_for_next_command();
+   thd->rand_used= 0;
+   thd->sent_row_count= thd->examined_row_count= 0;
++  logical_reads = physical_reads = 0;
+ 
+   thd->reset_current_stmt_binlog_format_row();
+   thd->binlog_unsafe_warning_flags= 0;
+diff -urNad mysql-5.5.20.raw/sql/sql_profile.cc mysql-5.5.20.new/sql/sql_profile.cc
+--- mysql-5.5.20.raw/sql/sql_profile.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_profile.cc	2012-08-20 17:51:21.000000000 +0800
+@@ -255,7 +255,7 @@
+ 
+ 
+ QUERY_PROFILE::QUERY_PROFILE(PROFILING *profiling_arg, const char *status_arg)
+-  :profiling(profiling_arg), profiling_query_id(0), query_source(NULL)
++  :profiling(profiling_arg), profiling_query_id(0), query_source(NULL),logical_reads(0),physical_reads(0)
+ {
+   profile_start= new PROF_MEASUREMENT(this, status_arg);
+   entries.push_back(profile_start);
+@@ -409,7 +409,8 @@
+         (! current->entries.is_empty()))
+     {
+       current->profiling_query_id= next_profile_id();   /* assign an id */
+-
++	  current->logical_reads = thd->logical_reads;
++	  current->physical_reads = thd->physical_reads;
+       history.push_back(current);
+       last= current; /* never contains something that is not in the history. */
+       current= NULL;
+@@ -438,6 +439,10 @@
+                                            MYSQL_TYPE_LONG));
+   field_list.push_back(new Item_return_int("Duration", TIME_FLOAT_DIGITS-1,
+                                            MYSQL_TYPE_DOUBLE));
++  field_list.push_back(new Item_return_int("Logical_reads", 12,
++										   MYSQL_TYPE_LONGLONG));
++  field_list.push_back(new Item_return_int("Physical_reads", 12,
++										   MYSQL_TYPE_LONGLONG));
+   field_list.push_back(new Item_empty_string("Query", 40));
+ 
+   if (thd->protocol->send_result_set_metadata(&field_list,
+@@ -472,6 +477,8 @@
+     protocol->store((uint32)(prof->profiling_query_id));
+     protocol->store((double)(pe->time_usecs - ps->time_usecs)/(1000.0*1000),
+                     (uint32) TIME_FLOAT_DIGITS-1, &elapsed);
++	protocol->store((longlong)prof->logical_reads);
++	protocol->store((longlong)prof->physical_reads);
+     if (prof->query_source != NULL)
+       protocol->store(prof->query_source, strlen(prof->query_source),
+                       system_charset_info);
+diff -urNad mysql-5.5.20.raw/sql/sql_profile.h mysql-5.5.20.new/sql/sql_profile.h
+--- mysql-5.5.20.raw/sql/sql_profile.h	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sql_profile.h	2012-08-20 17:51:21.000000000 +0800
+@@ -209,6 +209,8 @@
+   PROFILING *profiling;
+ 
+   query_id_t profiling_query_id;        /* Session-specific id. */
++  ulong		 logical_reads;
++  ulong		 physical_reads;
+   char *query_source;
+ 
+   PROF_MEASUREMENT *profile_start;
+diff -urNad mysql-5.5.20.raw/sql/sys_vars.cc mysql-5.5.20.new/sql/sys_vars.cc
+--- mysql-5.5.20.raw/sql/sys_vars.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.new/sql/sys_vars.cc	2012-08-20 17:51:21.000000000 +0800
+@@ -1045,6 +1045,13 @@
+        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+        ON_UPDATE(update_cached_long_query_time));
+ 
++static Sys_var_ulong Sys_long_query_io(
++	"long_query_io",
++	"Log all queries that have taken more than long_query_io "
++	"to execute to file. The argument will be treated as a decimal value ",
++	SESSION_VAR(long_query_io_ulong), CMD_LINE(REQUIRED_ARG),
++	VALID_RANGE(0, ULONG_MAX), DEFAULT(100), BLOCK_SIZE(1));
++
+ static bool fix_low_prio_updates(sys_var *self, THD *thd, enum_var_type type)
+ {
+   if (type == OPT_SESSION)
+@@ -2964,6 +2971,46 @@
+        DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+        ON_UPDATE(fix_log_state));
+ 
++static bool update_slow_query_type(sys_var *self, THD *thd, enum_var_type type)
++{
++	bool res;
++	my_bool  *UNINIT_VAR(slow_log_ptr), *UNINIT_VAR(io_log_ptr), newval, UNINIT_VAR(oldval);
++	uint UNINIT_VAR(log_type);
++	opt_slow_log = slow_query_type & 0x0001;
++	opt_slow_io_log = (slow_query_type & 0x0002) >> 1;
++	slow_log_ptr = &opt_slow_log;
++	io_log_ptr = &opt_slow_io_log;
++	oldval =  logger.get_slow_log_file_handler()->is_open();
++	log_type =  QUERY_LOG_SLOW;
++	newval = opt_slow_log || opt_slow_io_log;
++	if (oldval == newval)
++	{
++		return false;
++	}
++	*slow_log_ptr = *io_log_ptr = oldval;
++	mysql_mutex_unlock(&LOCK_global_system_variables);
++	if (!newval)
++	{
++		logger.deactivate_log_handler(thd, log_type);
++		res= false;
++	}
++	else
++	{
++		res= logger.activate_log_handler(thd, log_type);
++	}
++	mysql_mutex_lock(&LOCK_global_system_variables);
++	return res;
++}
++
++static Sys_var_ulong Sys_slow_query_type(
++	"slow_query_type", 
++	"Log slow queries to a table or log file. Defaults logging to a file "
++	"hostname-slow.log or a table mysql.slow_log if --log-output=TABLE is "
++	"used. Must be enabled to activate other slow log options",
++	GLOBAL_VAR(slow_query_type), CMD_LINE(OPT_ARG),
++	VALID_RANGE(0, 3), DEFAULT(0), BLOCK_SIZE(1),NO_MUTEX_GUARD,NOT_IN_BINLOG, ON_CHECK(0), 
++	ON_UPDATE(update_slow_query_type),DEPRECATED(70000,"'@@slow_query_type'"));
++
+ /* Synonym of "slow_query_log" for consistency with SHOW VARIABLES output */
+ static Sys_var_mybool Sys_log_slow(
+        "log_slow_queries",
+@@ -2987,6 +3034,7 @@
+   else if (self == &Sys_slow_query_log || self == &Sys_log_slow)
+   {
+     newvalptr= &opt_slow_log;
++	slow_query_type = (slow_query_type & 0x0002) + opt_slow_log;
+     oldval=    logger.get_slow_log_file_handler()->is_open();
+     log_type=  QUERY_LOG_SLOW;
+   }
+diff -urNad mysql-5.5.20.raw/storage/innobase/buf/buf0buf.c mysql-5.5.20.new/storage/innobase/buf/buf0buf.c
+--- mysql-5.5.20.raw/storage/innobase/buf/buf0buf.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/buf/buf0buf.c	2012-08-20 17:51:21.000000000 +0800
+@@ -51,6 +51,8 @@
+ #include "dict0dict.h"
+ #include "log0recv.h"
+ #include "page0zip.h"
++#include "iostat.h"
++#include "sql_iostat.h"
+ 
+ /*
+ 		IMPLEMENTATION OF THE BUFFER POOL
+@@ -240,6 +242,8 @@
+ the read requests for the whole area.
+ */
+ 
++_io_stat_func_ptr io_stat_func_ptr;
++
+ #ifndef UNIV_HOTBACKUP
+ /** Value in microseconds */
+ static const int WAIT_FOR_READ	= 5000;
+@@ -1822,7 +1826,6 @@
+ 		ut_a(++buf_dbg_counter % 37 || buf_validate());
+ #endif /* UNIV_DEBUG || UNIV_BUF_DEBUG */
+ 	}
+-
+ 	if (UNIV_UNLIKELY(!bpage->zip.data)) {
+ 		/* There is no compressed page. */
+ err_exit:
+@@ -2331,6 +2334,7 @@
+ #endif /* UNIV_DEBUG || UNIV_BUF_DEBUG */
+ 		goto loop;
+ 	}
++	io_stat_func_ptr(LOG_READ);
+ 
+ got_block:
+ 	ut_ad(page_zip_get_size(&block->page.zip) == zip_size);
+@@ -2737,6 +2741,7 @@
+ 			    buf_block_get_page_no(block)) == 0);
+ #endif
+ 	buf_pool = buf_pool_from_block(block);
++	io_stat_func_ptr(LOG_READ);
+ 	buf_pool->stat.n_page_gets++;
+ 
+ 	return(TRUE);
+@@ -2841,6 +2846,7 @@
+ 	     || (ibuf_count_get(buf_block_get_space(block),
+ 				buf_block_get_page_no(block)) == 0));
+ #endif
++	io_stat_func_ptr(LOG_READ);
+ 	buf_pool->stat.n_page_gets++;
+ 
+ 	return(TRUE);
+diff -urNad mysql-5.5.20.raw/storage/innobase/buf/buf0rea.c mysql-5.5.20.new/storage/innobase/buf/buf0rea.c
+--- mysql-5.5.20.raw/storage/innobase/buf/buf0rea.c	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/buf/buf0rea.c	2012-08-20 17:51:21.000000000 +0800
+@@ -39,6 +39,8 @@
+ #include "srv0srv.h"
+ #include "mysql/plugin.h"
+ #include "mysql/service_thd_wait.h"
++#include "sql_iostat.h"
++#include "iostat.h"
+ 
+ /** There must be at least this many pages in buf_pool in the area to start
+ a random read-ahead */
+@@ -159,7 +161,7 @@
+ 		fil_read */
+ 		buf_page_io_complete(bpage);
+ 	}
+-
++	io_stat_func_ptr(PHY_READ);
+ 	return(1);
+ }
+ 
+diff -urNad mysql-5.5.20.raw/storage/innobase/handler/ha_innodb.cc mysql-5.5.20.new/storage/innobase/handler/ha_innodb.cc
+--- mysql-5.5.20.raw/storage/innobase/handler/ha_innodb.cc	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/handler/ha_innodb.cc	2012-08-20 17:51:21.000000000 +0800
+@@ -90,6 +90,7 @@
+ 
+ #include "ha_innodb.h"
+ #include "i_s.h"
++#include "iostat.h"
+ 
+ # ifndef MYSQL_PLUGIN_IMPORT
+ #  define MYSQL_PLUGIN_IMPORT /* nothing */
+@@ -2243,6 +2244,7 @@
+         innobase_hton->release_temporary_latches=innobase_release_temporary_latches;
+ 	innobase_hton->alter_table_flags = innobase_alter_table_flags;
+ 
++	io_stat_func_ptr = innobase_hton->io_stat_ptr;
+ 	ut_a(DATA_MYSQL_TRUE_VARCHAR == (ulint)MYSQL_TYPE_VARCHAR);
+ 
+ #ifndef DBUG_OFF
+diff -urNad mysql-5.5.20.raw/storage/innobase/include/iostat.h mysql-5.5.20.new/storage/innobase/include/iostat.h
+--- mysql-5.5.20.raw/storage/innobase/include/iostat.h	1970-01-01 08:00:00.000000000 +0800
++++ mysql-5.5.20.new/storage/innobase/include/iostat.h	2012-08-20 17:51:21.000000000 +0800
+@@ -0,0 +1,15 @@
++#ifndef IOSTAT_INCLUDED
++#define IOSTAT_INCLUDED
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef void (*_io_stat_func_ptr)(uint stat_type);
++
++extern _io_stat_func_ptr io_stat_func_ptr;
++
++#ifdef __cplusplus
++}
++#endif
++#endif /*IOSTAT_INCLUDED*/

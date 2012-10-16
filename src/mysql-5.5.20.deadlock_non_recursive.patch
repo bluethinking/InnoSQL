@@ -1,0 +1,418 @@
+Index: storage/innobase/lock/lock0lock.c
+===================================================================
+--- storage/innobase/lock/lock0lock.c	(.../https://svn.hz.netease.com/svn/innosql/trunk/mysql-5.5.20)	(revision 160)
++++ storage/innobase/lock/lock0lock.c	(working copy)
+@@ -409,6 +409,28 @@
+ 				LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK, we
+ 				return LOCK_EXCEED_MAX_DEPTH */
+ 
++/********************************************************************//**
++Looks non_recursively for a deadlock.
++@return 0 if no deadlock found, LOCK_VICTIM_IS_START if there was a
++deadlock and we chose 'start' as the victim, LOCK_VICTIM_IS_OTHER if a
++deadlock was found and we chose some other trx as a victim: we must do
++the search again in this last case because there may be another
++deadlock!
++LOCK_EXCEED_MAX_DEPTH if the lock search exceeds max steps or max depth. */
++static
++ulint
++lock_deadlock_non_recursive(
++/*====================*/
++	trx_t*	start,		/*!< in: recursion starting point */
++	trx_t*	trx,		/*!< in: a transaction waiting for a lock */
++	lock_t*	wait_lock,	/*!< in:  lock that is waiting to be granted */
++	ulint*	cost,		/*!< in/out: number of calculation steps thus
++				far: if this exceeds LOCK_MAX_N_STEPS_...
++				we return LOCK_EXCEED_MAX_DEPTH */
++	ulint	depth);		/*!< in: recursion depth: if this exceeds
++				LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK, we
++				return LOCK_EXCEED_MAX_DEPTH */			
++
+ /*********************************************************************//**
+ Gets the nth bit of a record lock.
+ @return	TRUE if bit set also if i == ULINT_UNDEFINED return FALSE*/
+@@ -3264,6 +3286,9 @@
+ @return TRUE if a deadlock was detected and we chose trx as a victim;
+ FALSE if no deadlock, or there was a deadlock, but we chose other
+ transaction(s) as victim(s) */
++
++my_bool lock_optimize_deadlock = FALSE;
++
+ static
+ ibool
+ lock_deadlock_occurs(
+@@ -3289,9 +3314,10 @@
+ 		mark_trx->deadlock_mark = 0;
+ 		mark_trx = UT_LIST_GET_NEXT(trx_list, mark_trx);
+ 	}
++	//argument 'innodb_optimize_deadlock'  is used for turnning on or off the optimization of deadlock check
++	ret = lock_optimize_deadlock ? lock_deadlock_non_recursive(trx, trx, lock, &cost, 0) : 
++									 lock_deadlock_recursive(trx, trx, lock, &cost, 0);
+ 
+-	ret = lock_deadlock_recursive(trx, trx, lock, &cost, 0);
+-
+ 	switch (ret) {
+ 	case LOCK_VICTIM_IS_OTHER:
+ 		/* We chose some other trx as a victim: retry if there still
+@@ -3568,6 +3594,311 @@
+ 	}/* end of the 'for (;;)'-loop */
+ }
+ 
++/********************************************************************//**
++Looks non_recursively for a deadlock.
++@return 0 if no deadlock found, LOCK_VICTIM_IS_START if there was a
++deadlock and we chose 'start' as the victim, LOCK_VICTIM_IS_OTHER if a
++deadlock was found and we chose some other trx as a victim: we must do
++the search again in this last case because there may be another
++deadlock!
++LOCK_EXCEED_MAX_DEPTH if the lock search exceeds max steps or max depth. */
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++typedef struct
++{
++	void* base[LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK + 2];	//WHEN base is full, depth > LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK is true¬»
++	unsigned int size;
++}lock_or_trx_stack;
++
++static inline void lock_or_trx_stack_init(lock_or_trx_stack* s)
++{
++	s->size = 0;
++}
++static inline void lock_or_trx_stack_push(lock_or_trx_stack* s, void* p)
++{
++	s->base[s->size++] = p;
++}
++static inline void* lock_or_trx_stack_top(lock_or_trx_stack* s)
++{
++	return s->base[s->size - 1];
++}
++static inline void lock_or_trx_stack_pop(lock_or_trx_stack* s)
++{
++	--s->size;
++}
++static inline unsigned int lock_or_trx_stack_empty(lock_or_trx_stack* s)
++{
++	return s->size == 0;
++}
++
++typedef struct
++{
++	unsigned long base[LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK + 2];		
++	unsigned int size;
++}Heap_No_stack;
++
++static inline void heap_no_stack_init(Heap_No_stack* s)
++{
++	s->size = 0;
++}
++static inline void heap_no_stack_push(Heap_No_stack* s, unsigned long p)
++{
++	s->base[s->size++] = p;
++}
++static inline unsigned long  heap_no_stack_top(Heap_No_stack* s)
++{
++	return s->base[s->size - 1];
++}
++static inline void heap_no_stack_pop(Heap_No_stack* s)
++{
++	--s->size;
++}
++static inline unsigned int heap_no_stack_empty(Heap_No_stack* s)
++{
++	return s->size == 0;
++}
++
++
++static
++ulint
++lock_deadlock_non_recursive(
++	trx_t*	start,		/*!< in: starting point, start == trx */
++	trx_t*	trx,		/*!< in: a transaction waiting for a lock */
++	lock_t*	wait_lock,	/*!< in: lock that is waiting to be granted. wait_lock->trx == start == trx ,  trx->wait_lock==wait_lock */
++	ulint*	cost,		/*!< in/out: number of calculation steps thus far: if this exceeds LOCK_MAX_N_STEPS_...we return LOCK_EXCEED_MAX_DEPTH */
++	ulint	depth)		/*!< in: recursion depth: if this exceeds LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK, we return LOCK_EXCEED_MAX_DEPTH */
++{
++	lock_t*	lock;
++	trx_t*	lock_trx;
++	ulint	heap_no		= ULINT_UNDEFINED;
++	lock_or_trx_stack 	lock_stack;		
++	lock_or_trx_stack  	trx_stack;
++	Heap_No_stack 		heap_no_stack;
++	ibool				trx_is_first_deal;/*When True, find the first lock that wait_lock is waitting;
++											Otherwise, find next lock. SET it to TRUE when push a trx
++											into the stack, and set it to FALSE WHEN trx is poped from stack*/
++														
++	
++	ut_a(start);		
++	ut_a(wait_lock);
++	ut_ad(mutex_own(&kernel_mutex));
++	
++	lock_or_trx_stack_init(&lock_stack);
++	lock_or_trx_stack_init(&trx_stack);
++	heap_no_stack_init(&heap_no_stack);
++	
++	lock_or_trx_stack_push(&trx_stack, trx);
++	trx_is_first_deal = TRUE;
++	
++	while(!lock_or_trx_stack_empty(&trx_stack))
++	{
++		trx = lock_or_trx_stack_top(&trx_stack);
++		
++		if(trx->deadlock_mark == 1)
++		{
++			lock_or_trx_stack_pop(&trx_stack);
++			trx_is_first_deal = FALSE;
++		}
++		else
++		{
++			wait_lock = trx->wait_lock;
++			
++			if(trx_is_first_deal) //find the first lock
++			{
++				++*cost;	//only when trx is first dealed,  we plus the cost
++				if (lock_get_type_low(wait_lock) == LOCK_REC) 
++				{
++					ulint		space;
++					ulint		page_no;
++
++					heap_no = lock_rec_find_set_bit(wait_lock);
++					ut_a(heap_no != ULINT_UNDEFINED);
++
++					space = wait_lock->un_member.rec_lock.space;
++					page_no = wait_lock->un_member.rec_lock.page_no;
++
++					lock = lock_rec_get_first_on_page_addr(space, page_no);
++
++					/* Position the iterator on the first matching record lock. */
++					while (lock && lock != wait_lock && !lock_rec_get_nth_bit(lock, heap_no))
++						lock = lock_rec_get_next_on_page(lock);
++					if (lock == wait_lock) 
++						lock = NULL;
++					ut_ad(lock == NULL || lock_rec_get_nth_bit(lock, heap_no));
++				} else {
++					lock = UT_LIST_GET_PREV(un_member.tab_lock.locks,wait_lock);
++					}
++
++				heap_no_stack_push(&heap_no_stack,heap_no);
++			}
++			else
++			{
++				heap_no = heap_no_stack_top(&heap_no_stack);
++				lock = lock_or_trx_stack_top(&lock_stack);	//lock != NULL
++				lock_or_trx_stack_pop(&lock_stack);	
++				if(heap_no == ULINT_UNDEFINED)
++				{
++					lock = UT_LIST_GET_PREV(un_member.tab_lock.locks,lock);
++				}
++				else
++				{
++					do {
++						lock = lock_rec_get_next_on_page(lock);
++						} while (lock && lock != wait_lock && !lock_rec_get_nth_bit(lock, heap_no));
++
++				if (lock == wait_lock) {
++					lock = NULL;
++					}
++				}
++			}
++
++			if(heap_no == ULINT_UNDEFINED)
++			{
++				while(lock && !lock_has_to_wait(wait_lock,lock))
++					lock = UT_LIST_GET_PREV(un_member.tab_lock.locks,lock);
++			}
++			else
++			{
++				while(lock && !lock_has_to_wait(wait_lock,lock))
++				{
++					do {
++						lock = lock_rec_get_next_on_page(lock);
++						} while (lock && lock != wait_lock && !lock_rec_get_nth_bit(lock, heap_no));
++
++				if (lock == wait_lock) {
++					lock = NULL;
++					}
++				}
++			}
++			
++
++			if(lock == NULL)
++			{
++				trx->deadlock_mark = 1;
++				lock_or_trx_stack_pop(&trx_stack);
++				trx_is_first_deal = FALSE;
++				heap_no_stack_pop(&heap_no_stack);
++			}
++
++			else
++			{
++				lock_trx = lock->trx;
++
++				if (lock_trx == start) {   //deadlock occured
++					FILE*	ef = lock_latest_err_file;
++					rewind(ef);
++					ut_print_timestamp(ef);
++					fputs("\n*** (1) TRANSACTION:\n", ef);
++					trx_print(ef, wait_lock->trx, 3000);
++
++					fputs("*** (1) WAITING FOR THIS LOCK"
++				     	 " TO BE GRANTED:\n", ef);
++
++					if (lock_get_type_low(wait_lock) == LOCK_REC) {
++						lock_rec_print(ef, wait_lock);
++					} else {
++						lock_table_print(ef, wait_lock);
++					}
++
++					fputs("*** (2) TRANSACTION:\n", ef);
++
++					trx_print(ef, lock->trx, 3000);
++
++					fputs("*** (2) HOLDS THE LOCK(S):\n", ef);
++
++					if (lock_get_type_low(lock) == LOCK_REC) {
++						lock_rec_print(ef, lock);
++					} else {
++						lock_table_print(ef, lock);
++					}
++
++					fputs("*** (2) WAITING FOR THIS LOCK"
++				    	  " TO BE GRANTED:\n", ef);
++
++					if (lock_get_type_low(start->wait_lock)
++				  	  == LOCK_REC) {
++						lock_rec_print(ef, start->wait_lock);
++					} else {
++						lock_table_print(ef, start->wait_lock);
++					}
++#ifdef UNIV_DEBUG
++					if (lock_print_waits) {
++						fputs("Deadlock detected\n",
++					      	stderr);
++					}
++#endif /* UNIV_DEBUG */
++
++					if (trx_weight_ge(wait_lock->trx, start)) {
++					/* Our recursion starting point
++					transaction is 'smaller', let us
++					choose 'start' as the victim and roll
++					back it */
++
++						return(LOCK_VICTIM_IS_START);
++					}
++
++					lock_deadlock_found = TRUE;
++
++				/* Let us choose the transaction of wait_lock
++				as a victim to try to avoid deadlocking our
++				recursion starting point transaction */
++
++					fputs("*** WE ROLL BACK TRANSACTION (1)\n",
++				      ef);
++
++					wait_lock->trx->was_chosen_as_deadlock_victim
++					= TRUE;
++
++					lock_cancel_waiting_and_release(wait_lock);
++
++				/* Since trx and wait_lock are no longer
++				in the waits-for graph, we can return FALSE;
++				note that our selective algorithm can choose
++				several transactions as victims, but still
++				we may end up rolling back also the recursion
++				starting point transaction! */
++
++					return(LOCK_VICTIM_IS_OTHER);
++					}
++
++				depth = trx_stack.size - 1;
++				if (depth >  LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK || *cost > LOCK_MAX_N_STEPS_IN_DEADLOCK_CHECK)
++				{
++ #ifdef UNIV_DEBUG
++					if (lock_print_waits) {
++						fputs("Deadlock search exceeds"
++					    	  " max steps or depth.\n",
++					    	  stderr);
++				}
++#endif /* UNIV_DEBUG */
++				/* The information about transaction/lock
++				to be rolled back is available in the top
++				level. Do not print anything here. */
++					return(LOCK_EXCEED_MAX_DEPTH);
++				}
++				
++				lock_or_trx_stack_push(&lock_stack, lock);
++				if (lock_trx->que_state == TRX_QUE_LOCK_WAIT)
++				{
++				
++					lock_or_trx_stack_push(&trx_stack, lock_trx);
++					trx_is_first_deal = TRUE;
++				}	
++				else	//such kind of trx will not be pushed into the stack
++				{
++					trx_is_first_deal = FALSE;	//To  ensure that the first lock_trx in this case, we can find the next lock
++					//lock_trx->deadlock_mark = 1;	//for this thx will not be pushed into stack, we donn't need to assign in to 1
++				}
++				
++		
++			}
++		}
++		
++	}
++	return 0;
++}
++
++
+ /*========================= TABLE LOCKS ==============================*/
+ 
+ /*********************************************************************//**
+Index: storage/innobase/handler/ha_innodb.cc
+===================================================================
+--- storage/innobase/handler/ha_innodb.cc	(.../https://svn.hz.netease.com/svn/innosql/trunk/mysql-5.5.20)	(revision 160)
++++ storage/innobase/handler/ha_innodb.cc	(working copy)
+@@ -86,6 +86,8 @@
+ #include "ha_prototypes.h"
+ #include "ut0mem.h"
+ #include "ibuf0ibuf.h"
++#include "lock0lock.h"	//Added for deadlock optimization
++
+ }
+ 
+ #include "ha_innodb.h"
+@@ -11406,6 +11408,15 @@
+   "Use native AIO if supported on this platform.",
+   NULL, NULL, TRUE);
+ 
++
++//Added for deadlock optimization
++static MYSQL_SYSVAR_BOOL(optimize_deadlock, lock_optimize_deadlock,
++  PLUGIN_VAR_OPCMDARG,
++  "Enable optimization for InnoDB deadlock  checking(Disabled by default). "
++  "Enable with --innodb-optimize_deadlock.",
++  NULL, NULL, FALSE);
++
++
+ static MYSQL_SYSVAR_STR(change_buffering, innobase_change_buffering,
+   PLUGIN_VAR_RQCMDARG,
+   "Buffer changes to reduce random access: "
+@@ -11494,6 +11505,7 @@
+   MYSQL_SYSVAR(thread_concurrency),
+   MYSQL_SYSVAR(thread_sleep_delay),
+   MYSQL_SYSVAR(autoinc_lock_mode),
++  MYSQL_SYSVAR(optimize_deadlock),	//Added for deadlock optimization
+   MYSQL_SYSVAR(version),
+   MYSQL_SYSVAR(use_sys_malloc),
+   MYSQL_SYSVAR(use_native_aio),
+Index: storage/innobase/include/lock0lock.h
+===================================================================
+--- storage/innobase/include/lock0lock.h	(.../https://svn.hz.netease.com/svn/innosql/trunk/mysql-5.5.20)	(revision 160)
++++ storage/innobase/include/lock0lock.h	(working copy)
+@@ -38,6 +38,8 @@
+ #include "hash0hash.h"
+ #include "ut0vec.h"
+ 
++extern my_bool lock_optimize_deadlock;	//Added for deadlock optimization
++
+ #ifdef UNIV_DEBUG
+ extern ibool	lock_print_waits;
+ #endif /* UNIV_DEBUG */

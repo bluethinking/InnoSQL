@@ -1,0 +1,196 @@
+diff -ur mysql-5.5.20/client/mysqlbinlog.cc mysql-5.5.20.binlog/client/mysqlbinlog.cc
+--- mysql-5.5.20/client/mysqlbinlog.cc	2011-12-17 03:52:07.000000000 +0800
++++ mysql-5.5.20.binlog/client/mysqlbinlog.cc	2012-09-06 11:22:12.000000000 +0800
+@@ -82,6 +82,7 @@
+ static uint my_end_arg;
+ static const char* sock= 0;
+ static char *opt_plugin_dir= 0, *opt_default_auth= 0;
++extern my_bool opt_binlog_user_ip;
+ 
+ #ifdef HAVE_SMEM
+ static char *shared_memory_base_name= 0;
+@@ -1014,6 +1015,9 @@
+ 
+ static struct my_option my_long_options[] =
+ {
++  {"binlog-user-ip", 'B', "show user and ip of a statement in binlog.",
++   &opt_binlog_user_ip, &opt_binlog_user_ip, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0,
++   0, 0},
+   {"help", '?', "Display this help and exit.",
+    0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
+   {"base64-output", OPT_BASE64_OUTPUT_MODE,
+diff -ur mysql-5.5.20/sql/log_event.cc mysql-5.5.20.binlog/sql/log_event.cc
+--- mysql-5.5.20/sql/log_event.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.binlog/sql/log_event.cc	2012-09-06 11:00:08.000000000 +0800
+@@ -14,7 +14,6 @@
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+ 
+-
+ #ifdef MYSQL_CLIENT
+ 
+ #include "sql_priv.h"
+@@ -639,7 +638,7 @@
+   @return
+   returns the human readable name of the event's type
+ */
+-
++my_bool opt_binlog_user_ip= 0;
+ const char* Log_event::get_type_str(Log_event_type type)
+ {
+   switch(type) {
+@@ -2193,7 +2192,6 @@
+     EVENT_LEN_OFFSET as we don't yet know how many status variables we
+     will print!
+ */
+-
+ bool Query_log_event::write(IO_CACHE* file)
+ {
+   uchar buf[QUERY_HEADER_LEN + MAX_SIZE_LOG_EVENT_STATUS];
+@@ -2403,20 +2401,65 @@
+   status_vars_len= (uint) (start-start_of_status);
+   DBUG_ASSERT(status_vars_len <= MAX_SIZE_LOG_EVENT_STATUS);
+   int2store(buf + Q_STATUS_VARS_LEN_OFFSET, status_vars_len);
+-
+   /*
++   add user and ip into query event
++  */
++  ulong user_len = 0;
++  if(0 != thd->security_ctx->user)
++  {
++      user_len = strlen(thd->security_ctx->user);
++  }
++  ulong ip_host_len = strlen("unknow");
++  const char* ip_host = "unknow";
++  if(0 != thd->security_ctx->ip)
++  {
++      ip_host_len = strlen(thd->security_ctx->ip);
++      ip_host = thd->security_ctx->ip;
++  }
++  else if(0 != thd->security_ctx->host)
++  {
++      ip_host_len = strlen(thd->security_ctx->host);
++      ip_host = thd->security_ctx->host;
++  }
++    /*
+     Calculate length of whole event
+     The "1" below is the \0 in the db's length
+   */
+   event_length= (uint) (start-buf) + get_post_header_size_for_derived() + db_len + 1 + q_len;
+-
+-  return (write_header(file, event_length) ||
++  if(opt_binlog_user_ip)
++  {
++   event_length+= 3 + user_len + ip_host_len;
++  }
++  bool rflag = 0;
++  rflag = (write_header(file, event_length) ||
+           my_b_safe_write(file, (uchar*) buf, QUERY_HEADER_LEN) ||
+           write_post_header_for_derived(file) ||
+           my_b_safe_write(file, (uchar*) start_of_status,
+                           (uint) (start-start_of_status)) ||
+-          my_b_safe_write(file, (db) ? (uchar*) db : (uchar*)"", db_len + 1) ||
+-          my_b_safe_write(file, (uchar*) query, q_len)) ? 1 : 0;
++          my_b_safe_write(file, (db) ? (uchar*) db : (uchar*)"", db_len + 1));
++
++  if(!opt_binlog_user_ip)
++  {
++   /*
++    don't need to record user and ip in binary log
++   */
++    rflag = rflag || my_b_safe_write(file, (uchar*) query, q_len);
++  }
++  else
++  {
++    /*
++     add user and ip into query event
++    */
++    uchar *query_tmp = (uchar*)my_malloc(q_len + 1, MYF(MY_WME));
++    memmove(query_tmp, query, q_len);
++    query_tmp[q_len] = 0;
++    rflag = rflag || my_b_safe_write(file, (uchar*) query_tmp, q_len + 1);
++    my_free(query_tmp);
++    rflag = rflag || (my_b_safe_write(file, (uchar*) thd->security_ctx->user, user_len) ||
++          my_b_safe_write(file, (uchar*) "@", 1) ||
++          my_b_safe_write(file, (uchar*) ip_host, ip_host_len + 1));
++  }
++  return rflag ? 1 : 0;
+ }
+ 
+ /**
+@@ -2693,7 +2736,7 @@
+   } while (0)
+ 
+ 
+-/**
++/*
+   This is used by the SQL slave thread to prepare the event before execution.
+ */
+ Query_log_event::Query_log_event(const char* buf, uint event_len,
+@@ -2947,7 +2990,14 @@
+   start[data_len]= '\0';              // End query with \0 (For safetly)
+   db= (char *)start;
+   query= (char *)(start + db_len + 1);
+-  q_len= data_len - db_len -1;
++  if(opt_binlog_user_ip)
++  {
++    q_len= strlen(query);
++  }
++  else
++  {
++    q_len= data_len - db_len -1;
++  }
+   DBUG_VOID_RETURN;
+ }
+ 
+@@ -3132,6 +3182,11 @@
+   print_query_header(&cache, print_event_info);
+   my_b_write(&cache, (uchar*) query, q_len);
+   my_b_printf(&cache, "\n%s\n", print_event_info->delimiter);
++  if(opt_binlog_user_ip)
++  {
++    const char *user_ip = query + q_len + 1;
++    my_b_printf(&cache, "#%s\n", user_ip);
++  }
+ }
+ #endif /* MYSQL_CLIENT */
+ 
+diff -ur mysql-5.5.20/sql/sys_vars.cc mysql-5.5.20.binlog/sql/sys_vars.cc
+--- mysql-5.5.20/sql/sys_vars.cc	2011-12-17 03:52:06.000000000 +0800
++++ mysql-5.5.20.binlog/sql/sys_vars.cc	2012-09-06 11:31:28.000000000 +0800
+@@ -58,6 +58,10 @@
+ */
+ extern void close_thread_tables(THD *thd);
+ 
++/*
++  Used with --binlog-user-ip for recording user and ip in binnry log
++*/
++extern my_bool opt_binlog_user_ip;
+ 
+ static bool update_buffer_size(THD *thd, KEY_CACHE *key_cache,
+                                ptrdiff_t offset, ulonglong new_value)
+@@ -295,6 +299,12 @@
+        GLOBAL_VAR(sp_automatic_privileges),
+        CMD_LINE(OPT_ARG), DEFAULT(TRUE));
+ 
++static Sys_var_mybool Sys_binlog_userip_enable(
++       "binlog_user_ip",
++       "Record user and ip of a statement in binlog",
++       READ_ONLY GLOBAL_VAR(opt_binlog_user_ip),
++       CMD_LINE(OPT_ARG), DEFAULT(FALSE));
++
+ static Sys_var_ulong Sys_back_log(
+        "back_log", "The number of outstanding connection requests "
+        "MySQL can have. This comes into play when the main MySQL thread "
+diff -ur mysql-5.5.20/support-files/mysql.5.5.20.spec mysql-5.5.20.binlog/support-files/mysql.5.5.20.spec
+--- mysql-5.5.20/support-files/mysql.5.5.20.spec	2011-12-17 03:52:16.000000000 +0800
++++ mysql-5.5.20.binlog/support-files/mysql.5.5.20.spec	2012-09-06 11:10:30.000000000 +0800
+@@ -244,7 +244,7 @@
+ Version:        5.5.20
+ Release:        %{release}%{?distro_releasetag:.%{distro_releasetag}}
+ Distribution:   %{distro_description}
+-License:        Copyright (c) 2000, 2011, %{mysql_vendor}. All rights reserved. Under %{license_type} license as shown in the Description field.
++License:        Copyright (c) 2000, 2012, %{mysql_vendor}. All rights reserved. Under %{license_type} license as shown in the Description field.
+ Source:         http://www.mysql.com/Downloads/MySQL-5.5/%{src_dir}.tar.gz
+ URL:            http://www.mysql.com/
+ Packager:       MySQL Release Engineering <mysql-build@oss.oracle.com>
