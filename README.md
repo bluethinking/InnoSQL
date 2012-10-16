@@ -1,7 +1,7 @@
 ﻿InnoSQL - A branch version of MySQL
 ===================================
 
-InnoSQL是MySQL数据库的一个分支版本，其完全兼容与Oracle MySQL，添加的补丁、插件、存储引擎都是动态的。InnoSQL的目标是提供更好的MySQL数据库性能，以及将一些富有创意的想法用于数据库的生产环境。
+InnoSQL是MySQL数据库的一个分支版本，其完全兼容于Oracle MySQL，添加的补丁、插件、存储引擎都是动态的。InnoSQL的目标是提供更好的MySQL数据库性能，以及将一些富有创意的想法用于数据库的生产环境。
 
  * Homepage: <https://github.com/NetEase/InnoSQL>
  * Wiki: <https://github.com/NetEase/InnoSQL/wiki/>
